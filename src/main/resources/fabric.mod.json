@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "roundtimer",
+  "version": "${version}",
+  "name": "Round Timer",
+  "description": "Таймер раунда с BossBar и переводом погибших игроков в спектаторы.",
+  "environment": "*",
+  "entrypoints": {
+    "main": ["com.friends.timer.TimerMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
