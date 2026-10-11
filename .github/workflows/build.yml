@@ -11,10 +11,10 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 21
+          java-version: 25
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.8
+          gradle-version: 9.6.0
       - run: gradle build
       - uses: actions/upload-artifact@v4
         with:
