@@ -44,7 +44,7 @@ public class TimerMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        bar = new ServerBossEvent(Component.literal(""),
+        bar = new ServerBossEvent(UUID.randomUUID(), Component.literal(""),
                 BossEvent.BossBarColor.GREEN, BossEvent.BossBarOverlay.PROGRESS);
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
