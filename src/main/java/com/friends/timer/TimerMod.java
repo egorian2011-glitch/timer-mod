@@ -8,28 +8,27 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
-import net.minecraft.entity.boss.BossBar;
-import net.minecraft.entity.boss.ServerBossBar;
+import net.minecraft.ChatFormatting;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.commands.Commands;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.text.Text;
-import net.minecraft.util.Formatting;
-import net.minecraft.world.GameMode;
+import net.minecraft.server.level.ServerBossEvent;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.permissions.Permissions;
+import net.minecraft.world.BossEvent;
+import net.minecraft.world.level.GameType;
 
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
-
-import static net.minecraft.server.command.CommandManager.argument;
-import static net.minecraft.server.command.CommandManager.literal;
 
 public class TimerMod implements ModInitializer {
 
     private static final int TICKS_PER_MINUTE = 20 * 60;
 
     private static MinecraftServer server;
-    private static ServerBossBar bar;
+    private static ServerBossEvent bar;
 
     private static boolean running = false;
     private static boolean specEnabled = true;
@@ -39,54 +38,59 @@ public class TimerMod implements ModInitializer {
     private static final Set<UUID> deadPlayers = new HashSet<>();
     private static final Set<UUID> pendingSpectators = new HashSet<>();
 
+    private static boolean isOp(CommandSourceStack s) {
+        return s.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
+    }
+
     @Override
     public void onInitialize() {
-        bar = new ServerBossBar(Text.literal(""), BossBar.Color.GREEN, BossBar.Style.PROGRESS);
+        bar = new ServerBossEvent(Component.literal(""),
+                BossEvent.BossBarColor.GREEN, BossEvent.BossBarOverlay.PROGRESS);
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
                 dispatcher.register(
-                        literal("timer")
+                        Commands.literal("timer")
                                 .executes(ctx -> status(ctx))
-                                .then(literal("start")
-                                        .requires(s -> s.hasPermissionLevel(2))
-                                        .then(argument("minutes", IntegerArgumentType.integer(1, 1440))
+                                .then(Commands.literal("start")
+                                        .requires(TimerMod::isOp)
+                                        .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
                                                 .executes(ctx -> start(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
-                                .then(literal("add")
-                                        .requires(s -> s.hasPermissionLevel(2))
-                                        .then(argument("minutes", IntegerArgumentType.integer(1, 1440))
+                                .then(Commands.literal("add")
+                                        .requires(TimerMod::isOp)
+                                        .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
                                                 .executes(ctx -> add(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
-                                .then(literal("stop")
-                                        .requires(s -> s.hasPermissionLevel(2))
+                                .then(Commands.literal("stop")
+                                        .requires(TimerMod::isOp)
                                         .executes(ctx -> stop(ctx)))
-                                .then(literal("spec")
-                                        .requires(s -> s.hasPermissionLevel(2))
-                                        .then(literal("on").executes(ctx -> setSpec(ctx, true)))
-                                        .then(literal("off").executes(ctx -> setSpec(ctx, false)))
-                                        .then(literal("stop").executes(ctx -> specStop(ctx))))
+                                .then(Commands.literal("spec")
+                                        .requires(TimerMod::isOp)
+                                        .then(Commands.literal("on").executes(ctx -> setSpec(ctx, true)))
+                                        .then(Commands.literal("off").executes(ctx -> setSpec(ctx, false)))
+                                        .then(Commands.literal("stop").executes(ctx -> specStop(ctx))))
                 ));
 
         ServerTickEvents.END_SERVER_TICK.register(this::onTick);
 
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> {
-            if (running && entity instanceof ServerPlayerEntity player) {
-                deadPlayers.add(player.getUuid());
+            if (running && entity instanceof ServerPlayer player) {
+                deadPlayers.add(player.getUUID());
             }
         });
 
         ServerPlayConnectionEvents.JOIN.register((handler, sender, srv) -> {
-            ServerPlayerEntity player = handler.getPlayer();
+            ServerPlayer player = handler.getPlayer();
             if (running) {
                 bar.addPlayer(player);
             }
-            if (pendingSpectators.remove(player.getUuid())) {
-                player.changeGameMode(GameMode.SPECTATOR);
-                player.sendMessage(Text.literal("Ты погиб в прошлом раунде — теперь ты спектатор.")
-                        .formatted(Formatting.GRAY), false);
+            if (pendingSpectators.remove(player.getUUID())) {
+                player.setGameMode(GameType.SPECTATOR);
+                player.sendSystemMessage(Component.literal("Ты погиб в прошлом раунде — теперь ты спектатор.")
+                        .withStyle(ChatFormatting.GRAY));
             }
         });
 
         ServerLifecycleEvents.SERVER_STOPPING.register(srv -> {
-            bar.clearPlayers();
+            bar.removeAllPlayers();
             running = false;
             deadPlayers.clear();
         });
@@ -102,13 +106,13 @@ public class TimerMod implements ModInitializer {
             return;
         }
 
-        bar.setPercent(Math.max(0f, Math.min(1f, (float) remainingTicks / totalTicks)));
+        bar.setProgress(Math.max(0f, Math.min(1f, (float) remainingTicks / totalTicks)));
         if (remainingTicks % 20 == 0) {
             updateBarText();
         }
 
-        if (srv.getTicks() % 100 == 0) {
-            for (ServerPlayerEntity p : srv.getPlayerManager().getPlayerList()) {
+        if (srv.getTickCount() % 100 == 0) {
+            for (ServerPlayer p : srv.getPlayerList().getPlayers()) {
                 bar.addPlayer(p);
             }
         }
@@ -116,10 +120,10 @@ public class TimerMod implements ModInitializer {
 
     private static void updateBarText() {
         float percent = (float) remainingTicks / totalTicks;
-        if (percent > 0.5f) bar.setColor(BossBar.Color.GREEN);
-        else if (percent > 0.2f) bar.setColor(BossBar.Color.YELLOW);
-        else bar.setColor(BossBar.Color.RED);
-        bar.setName(Text.literal("⏳ Осталось: " + formatTime(remainingTicks)));
+        if (percent > 0.5f) bar.setColor(BossEvent.BossBarColor.GREEN);
+        else if (percent > 0.2f) bar.setColor(BossEvent.BossBarColor.YELLOW);
+        else bar.setColor(BossEvent.BossBarColor.RED);
+        bar.setName(Component.literal("⏳ Осталось: " + formatTime(remainingTicks)));
     }
 
     private static String formatTime(int ticks) {
@@ -127,9 +131,9 @@ public class TimerMod implements ModInitializer {
         return String.format("%02d:%02d", totalSeconds / 60, totalSeconds % 60);
     }
 
-    private static int start(CommandContext<ServerCommandSource> ctx, int minutes) {
+    private static int start(CommandContext<CommandSourceStack> ctx, int minutes) {
         if (running) {
-            ctx.getSource().sendError(Text.literal("Таймер уже запущен. Используй /timer add <минуты> или /timer stop."));
+            ctx.getSource().sendFailure(Component.literal("Таймер уже запущен. Используй /timer add <минуты> или /timer stop."));
             return 0;
         }
         server = ctx.getSource().getServer();
@@ -138,92 +142,92 @@ public class TimerMod implements ModInitializer {
         remainingTicks = totalTicks;
         deadPlayers.clear();
 
-        bar.clearPlayers();
-        for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
+        bar.removeAllPlayers();
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             bar.addPlayer(p);
         }
-        bar.setPercent(1f);
+        bar.setProgress(1f);
         updateBarText();
 
-        broadcast(Text.literal("▶ Таймер запущен на " + minutes + " мин.").formatted(Formatting.GREEN));
+        broadcast(Component.literal("▶ Таймер запущен на " + minutes + " мин.").withStyle(ChatFormatting.GREEN));
         return 1;
     }
 
-    private static int add(CommandContext<ServerCommandSource> ctx, int minutes) {
+    private static int add(CommandContext<CommandSourceStack> ctx, int minutes) {
         if (!running) {
-            ctx.getSource().sendError(Text.literal("Таймер не запущен. Используй /timer start <минуты>."));
+            ctx.getSource().sendFailure(Component.literal("Таймер не запущен. Используй /timer start <минуты>."));
             return 0;
         }
         remainingTicks += minutes * TICKS_PER_MINUTE;
         totalTicks += minutes * TICKS_PER_MINUTE;
         updateBarText();
-        broadcast(Text.literal("➕ Добавлено " + minutes + " мин. Осталось: " + formatTime(remainingTicks))
-                .formatted(Formatting.AQUA));
+        broadcast(Component.literal("➕ Добавлено " + minutes + " мин. Осталось: " + formatTime(remainingTicks))
+                .withStyle(ChatFormatting.AQUA));
         return 1;
     }
 
-    private static int stop(CommandContext<ServerCommandSource> ctx) {
+    private static int stop(CommandContext<CommandSourceStack> ctx) {
         if (!running) {
-            ctx.getSource().sendError(Text.literal("Таймер не запущен."));
+            ctx.getSource().sendFailure(Component.literal("Таймер не запущен."));
             return 0;
         }
         running = false;
-        bar.clearPlayers();
+        bar.removeAllPlayers();
         deadPlayers.clear();
-        broadcast(Text.literal("⏹ Таймер остановлен. Игроки в спектаторов не переводятся.")
-                .formatted(Formatting.YELLOW));
+        broadcast(Component.literal("⏹ Таймер остановлен. Игроки в спектаторов не переводятся.")
+                .withStyle(ChatFormatting.YELLOW));
         return 1;
     }
 
-    private static int specStop(CommandContext<ServerCommandSource> ctx) {
+    private static int specStop(CommandContext<CommandSourceStack> ctx) {
         specEnabled = false;
         boolean wasRunning = running;
         if (running) {
             running = false;
-            bar.clearPlayers();
+            bar.removeAllPlayers();
         }
         deadPlayers.clear();
-        broadcast(Text.literal((wasRunning ? "⏹ Таймер остановлен. " : "")
-                + "Перевод погибших в спектаторы отключён.").formatted(Formatting.YELLOW));
+        broadcast(Component.literal((wasRunning ? "⏹ Таймер остановлен. " : "")
+                + "Перевод погибших в спектаторы отключён.").withStyle(ChatFormatting.YELLOW));
         return 1;
     }
 
-    private static int setSpec(CommandContext<ServerCommandSource> ctx, boolean enabled) {
+    private static int setSpec(CommandContext<CommandSourceStack> ctx, boolean enabled) {
         specEnabled = enabled;
-        broadcast(Text.literal(enabled
+        broadcast(Component.literal(enabled
                 ? "Перевод погибших в спектаторы после окончания времени: ВКЛ"
                 : "Перевод погибших в спектаторы после окончания времени: ВЫКЛ")
-                .formatted(enabled ? Formatting.GREEN : Formatting.RED));
+                .withStyle(enabled ? ChatFormatting.GREEN : ChatFormatting.RED));
         return 1;
     }
 
-    private static int status(CommandContext<ServerCommandSource> ctx) {
+    private static int status(CommandContext<CommandSourceStack> ctx) {
         String timerState = running
                 ? "идёт, осталось " + formatTime(remainingTicks)
                 : "не запущен";
         String specState = specEnabled ? "включён" : "выключен";
-        ctx.getSource().sendFeedback(() -> Text.literal("⏱ Таймер: " + timerState
+        ctx.getSource().sendSuccess(() -> Component.literal("⏱ Таймер: " + timerState
                 + " | Перевод погибших в спектаторы: " + specState)
-                .formatted(Formatting.GOLD), false);
+                .withStyle(ChatFormatting.GOLD), false);
         return 1;
     }
 
     private static void finish() {
         running = false;
-        bar.clearPlayers();
+        bar.removeAllPlayers();
 
         if (!specEnabled) {
             deadPlayers.clear();
-            broadcast(Text.literal("⏰ Время вышло. Таймер остановлен. Перевод в спектаторы отключён.")
-                    .formatted(Formatting.RED));
+            broadcast(Component.literal("⏰ Время вышло. Таймер остановлен. Перевод в спектаторы отключён.")
+                    .withStyle(ChatFormatting.RED));
             return;
         }
 
         int moved = 0;
         for (UUID uuid : deadPlayers) {
-            ServerPlayerEntity p = server.getPlayerManager().getPlayer(uuid);
+            ServerPlayer p = server.getPlayerList().getPlayer(uuid);
             if (p != null) {
-                p.changeGameMode(GameMode.SPECTATOR);
+                p.setGameMode(GameType.SPECTATOR);
                 moved++;
             } else {
                 pendingSpectators.add(uuid);
@@ -231,13 +235,13 @@ public class TimerMod implements ModInitializer {
         }
         deadPlayers.clear();
 
-        broadcast(Text.literal("⏰ Время вышло. Таймер остановлен. Погибшие переведены в спектаторы: "
-                + moved + ". Живые продолжают игру.").formatted(Formatting.RED));
+        broadcast(Component.literal("⏰ Время вышло. Таймер остановлен. Погибшие переведены в спектаторы: "
+                + moved + ". Живые продолжают игру.").withStyle(ChatFormatting.RED));
     }
 
-    private static void broadcast(Text text) {
+    private static void broadcast(Component text) {
         if (server != null) {
-            server.getPlayerManager().broadcast(text, false);
+            server.getPlayerList().broadcastSystemMessage(text, false);
         }
     }
 }
