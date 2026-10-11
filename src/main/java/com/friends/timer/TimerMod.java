@@ -4,7 +4,7 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
@@ -25,18 +25,28 @@ import java.util.UUID;
 
 public class TimerMod implements ModInitializer {
 
+    /** Надпись, которая появляется по центру экрана, когда таймер закончился. */
+    private static final String HUNT_TITLE = "ПИДАБИР ВЫШЕЛ НА ОХОТУ";
+
     private static final int TICKS_PER_MINUTE = 20 * 60;
 
     private static MinecraftServer server;
     private static ServerBossEvent bar;
 
+    /** Идёт обратный отсчёт. */
     private static boolean running = false;
+    /** Таймер закончился, охота идёт: все, кто умер, становятся спектаторами. */
+    private static boolean hunting = false;
+    /** Если выключить, то после окончания таймера охоты не будет. */
     private static boolean specEnabled = true;
+
     private static int remainingTicks = 0;
     private static int totalTicks = 0;
 
-    private static final Set<UUID> deadPlayers = new HashSet<>();
-    private static final Set<UUID> pendingSpectators = new HashSet<>();
+    /** Игроки, которых мод перевёл в спектаторы во время охоты. */
+    private static final Set<UUID> spectated = new HashSet<>();
+    /** Спектаторы, которые были офлайн, когда охоту выключили. */
+    private static final Set<UUID> reviveOnJoin = new HashSet<>();
 
     private static boolean isOp(CommandSourceStack s) {
         return s.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
@@ -64,54 +74,57 @@ public class TimerMod implements ModInitializer {
                                         .executes(ctx -> stop(ctx)))
                                 .then(Commands.literal("spec")
                                         .requires(TimerMod::isOp)
-                                        .then(Commands.literal("on").executes(ctx -> setSpec(ctx, true)))
-                                        .then(Commands.literal("off").executes(ctx -> setSpec(ctx, false)))
-                                        .then(Commands.literal("stop").executes(ctx -> specStop(ctx))))
+                                        .then(Commands.literal("off").executes(ctx -> specOff(ctx))))
                 ));
 
         ServerTickEvents.END_SERVER_TICK.register(this::onTick);
 
-        ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> {
-            if (running && entity instanceof ServerPlayer player) {
-                deadPlayers.add(player.getUUID());
+        // Во время охоты любой, кто умер и возродился, становится спектатором
+        ServerPlayerEvents.AFTER_RESPAWN.register((oldPlayer, newPlayer, alive) -> {
+            if (hunting && !alive) {
+                newPlayer.setGameMode(GameType.SPECTATOR);
+                spectated.add(newPlayer.getUUID());
+                newPlayer.sendSystemMessage(Component.literal("☠ Ты погиб на охоте — теперь ты спектатор.")
+                        .withStyle(ChatFormatting.GRAY));
             }
         });
 
         ServerPlayConnectionEvents.JOIN.register((handler, sender, srv) -> {
             ServerPlayer player = handler.getPlayer();
-            if (running) {
+            if (running || hunting) {
                 bar.addPlayer(player);
             }
-            if (pendingSpectators.remove(player.getUUID())) {
-                player.setGameMode(GameType.SPECTATOR);
-                player.sendSystemMessage(Component.literal("Ты погиб в прошлом раунде — теперь ты спектатор.")
-                        .withStyle(ChatFormatting.GRAY));
+            if (reviveOnJoin.remove(player.getUUID())) {
+                player.setGameMode(GameType.SURVIVAL);
             }
         });
 
         ServerLifecycleEvents.SERVER_STOPPING.register(srv -> {
             bar.removeAllPlayers();
             running = false;
-            deadPlayers.clear();
+            hunting = false;
+            spectated.clear();
         });
     }
 
+    // ---------------------------------------------------------------- tick
+
     private void onTick(MinecraftServer srv) {
         server = srv;
-        if (!running) return;
 
-        remainingTicks--;
-        if (remainingTicks <= 0) {
-            finish();
-            return;
+        if (running) {
+            remainingTicks--;
+            if (remainingTicks <= 0) {
+                finish();
+                return;
+            }
+            bar.setProgress(Math.max(0f, Math.min(1f, (float) remainingTicks / totalTicks)));
+            if (remainingTicks % 20 == 0) {
+                updateBarText();
+            }
         }
 
-        bar.setProgress(Math.max(0f, Math.min(1f, (float) remainingTicks / totalTicks)));
-        if (remainingTicks % 20 == 0) {
-            updateBarText();
-        }
-
-        if (srv.getTickCount() % 100 == 0) {
+        if ((running || hunting) && srv.getTickCount() % 100 == 0) {
             for (ServerPlayer p : srv.getPlayerList().getPlayers()) {
                 bar.addPlayer(p);
             }
@@ -131,16 +144,22 @@ public class TimerMod implements ModInitializer {
         return String.format("%02d:%02d", totalSeconds / 60, totalSeconds % 60);
     }
 
+    // ------------------------------------------------------------ commands
+
     private static int start(CommandContext<CommandSourceStack> ctx, int minutes) {
         if (running) {
             ctx.getSource().sendFailure(Component.literal("Таймер уже запущен. Используй /timer add <минуты> или /timer stop."));
             return 0;
         }
+        if (hunting) {
+            ctx.getSource().sendFailure(Component.literal("Сейчас идёт охота. Сначала выключи её: /timer spec off"));
+            return 0;
+        }
         server = ctx.getSource().getServer();
         running = true;
+        specEnabled = true;
         totalTicks = minutes * TICKS_PER_MINUTE;
         remainingTicks = totalTicks;
-        deadPlayers.clear();
 
         bar.removeAllPlayers();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
@@ -168,75 +187,106 @@ public class TimerMod implements ModInitializer {
 
     private static int stop(CommandContext<CommandSourceStack> ctx) {
         if (!running) {
-            ctx.getSource().sendFailure(Component.literal("Таймер не запущен."));
+            if (hunting) {
+                ctx.getSource().sendFailure(Component.literal("Сейчас идёт охота, а не таймер. Чтобы её закончить: /timer spec off"));
+            } else {
+                ctx.getSource().sendFailure(Component.literal("Таймер не запущен."));
+            }
             return 0;
         }
         running = false;
         bar.removeAllPlayers();
-        deadPlayers.clear();
-        broadcast(Component.literal("⏹ Таймер остановлен. Игроки в спектаторов не переводятся.")
-                .withStyle(ChatFormatting.YELLOW));
+        broadcast(Component.literal("⏹ Таймер остановлен. Охоты не будет.").withStyle(ChatFormatting.YELLOW));
         return 1;
     }
 
-    private static int specStop(CommandContext<CommandSourceStack> ctx) {
+    private static int specOff(CommandContext<CommandSourceStack> ctx) {
         specEnabled = false;
-        boolean wasRunning = running;
-        if (running) {
-            running = false;
-            bar.removeAllPlayers();
+        if (hunting) {
+            endHunt();
+        } else if (running) {
+            broadcast(Component.literal("Перевод в спектаторы отключён: после окончания таймера охоты не будет.")
+                    .withStyle(ChatFormatting.YELLOW));
+        } else {
+            ctx.getSource().sendSuccess(() -> Component.literal("Перевод в спектаторы отключён.")
+                    .withStyle(ChatFormatting.YELLOW), false);
         }
-        deadPlayers.clear();
-        broadcast(Component.literal((wasRunning ? "⏹ Таймер остановлен. " : "")
-                + "Перевод погибших в спектаторы отключён.").withStyle(ChatFormatting.YELLOW));
-        return 1;
-    }
-
-    private static int setSpec(CommandContext<CommandSourceStack> ctx, boolean enabled) {
-        specEnabled = enabled;
-        broadcast(Component.literal(enabled
-                ? "Перевод погибших в спектаторы после окончания времени: ВКЛ"
-                : "Перевод погибших в спектаторы после окончания времени: ВЫКЛ")
-                .withStyle(enabled ? ChatFormatting.GREEN : ChatFormatting.RED));
         return 1;
     }
 
     private static int status(CommandContext<CommandSourceStack> ctx) {
-        String timerState = running
-                ? "идёт, осталось " + formatTime(remainingTicks)
-                : "не запущен";
-        String specState = specEnabled ? "включён" : "выключен";
-        ctx.getSource().sendSuccess(() -> Component.literal("⏱ Таймер: " + timerState
-                + " | Перевод погибших в спектаторы: " + specState)
+        String state;
+        if (running) state = "идёт, осталось " + formatTime(remainingTicks)
+                + (specEnabled ? "" : " (охоты в конце не будет)");
+        else if (hunting) state = "ОХОТА идёт, погибшие становятся спектаторами";
+        else state = "не запущен";
+        ctx.getSource().sendSuccess(() -> Component.literal("⏱ Таймер: " + state)
                 .withStyle(ChatFormatting.GOLD), false);
         return 1;
     }
+
+    // -------------------------------------------------------- end / hunt
 
     private static void finish() {
         running = false;
         bar.removeAllPlayers();
 
         if (!specEnabled) {
-            deadPlayers.clear();
-            broadcast(Component.literal("⏰ Время вышло. Таймер остановлен. Перевод в спектаторы отключён.")
-                    .withStyle(ChatFormatting.RED));
+            broadcast(Component.literal("⏰ Время вышло. Таймер остановлен.").withStyle(ChatFormatting.RED));
             return;
         }
+        startHunt();
+    }
 
-        int moved = 0;
-        for (UUID uuid : deadPlayers) {
+    private static void startHunt() {
+        hunting = true;
+        spectated.clear();
+
+        // Затемнение экрана + звук + надпись по центру на секунду
+        runCmd("effect give @a minecraft:blindness 4 0 true");
+        runCmd("execute as @a at @s run playsound minecraft:entity.wither.spawn master @s ~ ~ ~ 1 0.8");
+        runCmd("title @a times 5 20 10");
+        runCmd("title @a title {\"text\":\"" + HUNT_TITLE + "\",\"color\":\"dark_red\",\"bold\":true}");
+
+        // Красная полоска на время охоты
+        bar.setColor(BossEvent.BossBarColor.RED);
+        bar.setProgress(1f);
+        bar.setName(Component.literal("☠ ОХОТА ИДЁТ — погибшие становятся спектаторами"));
+        bar.removeAllPlayers();
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            bar.addPlayer(p);
+        }
+
+        broadcast(Component.literal("⏰ Время вышло! Теперь каждый, кто умрёт, станет спектатором.")
+                .withStyle(ChatFormatting.DARK_RED));
+    }
+
+    private static void endHunt() {
+        hunting = false;
+        bar.removeAllPlayers();
+
+        int revived = 0;
+        for (UUID uuid : spectated) {
             ServerPlayer p = server.getPlayerList().getPlayer(uuid);
             if (p != null) {
-                p.setGameMode(GameType.SPECTATOR);
-                moved++;
+                p.setGameMode(GameType.SURVIVAL);
+                revived++;
             } else {
-                pendingSpectators.add(uuid);
+                reviveOnJoin.add(uuid);
             }
         }
-        deadPlayers.clear();
+        spectated.clear();
 
-        broadcast(Component.literal("⏰ Время вышло. Таймер остановлен. Погибшие переведены в спектаторы: "
-                + moved + ". Живые продолжают игру.").withStyle(ChatFormatting.RED));
+        broadcast(Component.literal("✔ Охота закончена. Возвращено в игру: " + revived + ".")
+                .withStyle(ChatFormatting.GREEN));
+    }
+
+    // -------------------------------------------------------------- utils
+
+    private static void runCmd(String command) {
+        if (server == null) return;
+        server.getCommands().performPrefixedCommand(
+                server.createCommandSourceStack().withSuppressedOutput(), command);
     }
 
     private static void broadcast(Component text) {
