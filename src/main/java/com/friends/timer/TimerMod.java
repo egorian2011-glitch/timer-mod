@@ -48,6 +48,9 @@ public class TimerMod implements ModInitializer {
     /** Через сколько тиков ПВП все начинают светиться (5 минут). */
     private static final int GLOW_AFTER_TICKS = 5 * TICKS_PER_MINUTE;
 
+    /** Через сколько тиков после победы игра заканчивается (очистка и убийство). 200 = 10 сек. */
+    private static final int GAME_END_DELAY_TICKS = 20 * 10;
+
     private static final Random RANDOM = new Random();
 
     private static MinecraftServer server;
@@ -62,6 +65,17 @@ public class TimerMod implements ModInitializer {
 
     private static int remainingTicks = 0;
     private static int totalTicks = 0;
+
+    // --- игра (/game start) ---
+    private static boolean gameActive = false;
+    private static int gameEndTicks = 0;
+
+    // --- пауза ---
+    private static boolean paused = false;
+    /** Игрок, которого пауза не касается (для /playerpause). null — заморожены все. */
+    private static UUID pauseExempt = null;
+    /** Кого заморозили и в каком режиме он был (SURVIVAL или CREATIVE). */
+    private static final Map<UUID, GameType> frozenModes = new HashMap<>();
 
     // --- голосование ---
     private static boolean voteActive = false;
@@ -103,7 +117,7 @@ public class TimerMod implements ModInitializer {
                             .then(Commands.literal("start")
                                     .requires(TimerMod::isOp)
                                     .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
-                                            .executes(ctx -> start(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
+                                            .executes(ctx -> timerStart(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
                             .then(Commands.literal("add")
                                     .requires(TimerMod::isOp)
                                     .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
@@ -123,11 +137,37 @@ public class TimerMod implements ModInitializer {
             dispatcher.register(
                     Commands.literal("randomteam")
                             .requires(TimerMod::isOp)
-                            .executes(ctx -> randomTeam(ctx))
+                            .executes(ctx -> randomTeamCmd(ctx))
+            );
+
+            dispatcher.register(
+                    Commands.literal("game")
+                            .requires(TimerMod::isOp)
+                            .then(Commands.literal("start")
+                                    .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
+                                            .executes(ctx -> gameStart(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
+                            .then(Commands.literal("delete").executes(ctx -> gameDelete(ctx)))
+                            .then(Commands.literal("pause").executes(ctx -> gamePause(ctx)))
+                            .then(Commands.literal("resume").executes(ctx -> gameResume(ctx)))
+            );
+
+            dispatcher.register(
+                    Commands.literal("playerpause")
+                            .requires(TimerMod::isOp)
+                            .executes(ctx -> playerPause(ctx))
+                            .then(Commands.literal("off").executes(ctx -> gameResume(ctx)))
             );
         });
 
         ServerTickEvents.END_SERVER_TICK.register(this::onTick);
+
+        // Во время паузы игроки не получают урон (кроме того, кого пауза не касается)
+        ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) -> {
+            if (paused && entity instanceof ServerPlayer p && !p.getUUID().equals(pauseExempt)) {
+                return false;
+            }
+            return true;
+        });
 
         // Смерть во время ПВП: сообщение, звук, проверка победителей
         ServerLivingEntityEvents.AFTER_DEATH.register((entity, source) -> {
@@ -164,15 +204,22 @@ public class TimerMod implements ModInitializer {
         });
 
         ServerPlayConnectionEvents.JOIN.register((handler, sender, srv) -> {
+            server = srv;
             ServerPlayer player = handler.getPlayer();
             if (running || pvp) {
                 bar.addPlayer(player);
             }
             if (reviveOnJoin.remove(player.getUUID())) {
                 player.setGameMode(GameType.SURVIVAL);
+                String n = player.getName().getString();
+                runCmd("effect clear " + n + " minecraft:slowness");
+                runCmd("effect clear " + n + " minecraft:jump_boost");
             }
             if (pvp && fallen.contains(player.getUUID())) {
                 player.setGameMode(GameType.SPECTATOR);
+            }
+            if (paused && !player.getUUID().equals(pauseExempt)) {
+                freeze(player);
             }
         });
 
@@ -181,10 +228,15 @@ public class TimerMod implements ModInitializer {
             if (keepInvDisabled) {
                 setKeepInventory(true);
             }
+            if (paused) {
+                unfreezeAll();
+            }
             bar.removeAllPlayers();
             running = false;
             pvp = false;
+            paused = false;
             voteActive = false;
+            gameActive = false;
             fallen.clear();
             kills.clear();
         });
@@ -195,6 +247,32 @@ public class TimerMod implements ModInitializer {
     private void onTick(MinecraftServer srv) {
         server = srv;
         int tick = srv.getTickCount();
+
+        // Пауза: ничего не идёт, все заморожены
+        if (paused) {
+            if (tick % 20 == 0) {
+                bar.setColor(BossEvent.BossBarColor.WHITE);
+                if (running) {
+                    bar.setName(Component.literal("⏸ ПАУЗА — осталось " + formatTime(remainingTicks)));
+                } else if (pvp) {
+                    bar.setName(Component.literal("⏸ ПАУЗА — ПВП"));
+                }
+            }
+            if (tick % 40 == 0) {
+                for (ServerPlayer p : srv.getPlayerList().getPlayers()) {
+                    if (!p.getUUID().equals(pauseExempt)) freeze(p);
+                }
+            }
+            return;
+        }
+
+        // Конец игры после победы
+        if (gameEndTicks > 0) {
+            gameEndTicks--;
+            if (gameEndTicks == 0) {
+                finishGame();
+            }
+        }
 
         if (running) {
             remainingTicks--;
@@ -458,9 +536,189 @@ public class TimerMod implements ModInitializer {
         }
     }
 
-    // ------------------------------------------------------------ commands
+    // ------------------------------------------------------- /game commands
 
-    private static int start(CommandContext<CommandSourceStack> ctx, int minutes) {
+    private static int gameStart(CommandContext<CommandSourceStack> ctx, int minutes) {
+        server = ctx.getSource().getServer();
+        if (gameActive || running || pvp) {
+            ctx.getSource().sendFailure(Component.literal("Игра уже идёт. Сначала отмени её: /game delete"));
+            return 0;
+        }
+        if (paused) {
+            ctx.getSource().sendFailure(Component.literal("Сейчас пауза. Сначала сними её: /game resume"));
+            return 0;
+        }
+        if (server.getPlayerList().getPlayers().size() < 2) {
+            ctx.getSource().sendFailure(Component.literal("Для игры нужно минимум 2 игрока онлайн."));
+            return 0;
+        }
+
+        gameActive = true;
+        gameEndTicks = 0;
+
+        // 1. очистка инвентарей
+        runCmd("gamemode survival @a");
+        runCmd("clear @a");
+        broadcast(Component.literal("🎮 Игра начинается! Инвентари очищены.").withStyle(ChatFormatting.GOLD));
+
+        // 2. команды
+        randomTeams();
+
+        // 3. таймер
+        startTimer(minutes);
+        return 1;
+    }
+
+    private static int gameDelete(CommandContext<CommandSourceStack> ctx) {
+        server = ctx.getSource().getServer();
+        cancelGame();
+        broadcast(Component.literal("🛑 Игра отменена. Инвентари очищены, все убиты.")
+                .withStyle(ChatFormatting.RED));
+        return 1;
+    }
+
+    private static int gamePause(CommandContext<CommandSourceStack> ctx) {
+        server = ctx.getSource().getServer();
+        if (paused) {
+            ctx.getSource().sendFailure(Component.literal("Уже стоит пауза. Снять: /game resume"));
+            return 0;
+        }
+        doPause(null);
+        broadcast(Component.literal("⏸ ПАУЗА. Никто не может двигаться и ломать блоки.")
+                .withStyle(ChatFormatting.YELLOW));
+        return 1;
+    }
+
+    private static int playerPause(CommandContext<CommandSourceStack> ctx) {
+        server = ctx.getSource().getServer();
+        ServerPlayer player = ctx.getSource().getPlayer();
+        if (player == null) {
+            ctx.getSource().sendFailure(Component.literal("Эту команду можно писать только игроку."));
+            return 0;
+        }
+        if (paused) {
+            ctx.getSource().sendFailure(Component.literal("Уже стоит пауза. Снять: /game resume"));
+            return 0;
+        }
+        doPause(player.getUUID());
+        broadcast(Component.literal("⏸ ПАУЗА. Всё заморожено, кроме игрока "
+                + player.getName().getString() + ".").withStyle(ChatFormatting.YELLOW));
+        return 1;
+    }
+
+    private static int gameResume(CommandContext<CommandSourceStack> ctx) {
+        server = ctx.getSource().getServer();
+        if (!paused) {
+            ctx.getSource().sendFailure(Component.literal("Паузы сейчас нет."));
+            return 0;
+        }
+        doResume();
+        return 1;
+    }
+
+    private static void doPause(UUID exempt) {
+        paused = true;
+        pauseExempt = exempt;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (!p.getUUID().equals(exempt)) freeze(p);
+        }
+        titleAll("⏸ ПАУЗА", "yellow", "Игра приостановлена", "gray", "5 40 10");
+        soundAll("minecraft:block.note_block.bass", "1 0.6");
+    }
+
+    private static void doResume() {
+        paused = false;
+        pauseExempt = null;
+        unfreezeAll();
+        if (running) updateBarText();
+        else if (pvp) updatePvpBar();
+        titleAll("▶ ПРОДОЛЖАЕМ", "green", "", "gray", "5 30 10");
+        soundAll("minecraft:block.beacon.activate", "1 1.2");
+        broadcast(Component.literal("▶ Пауза снята.").withStyle(ChatFormatting.GREEN));
+    }
+
+    /** Замораживает игрока: нельзя двигаться, прыгать, ломать и ставить блоки. */
+    private static void freeze(ServerPlayer p) {
+        String n = p.getName().getString();
+        runCmd("effect give " + n + " minecraft:slowness infinite 255 true");
+        runCmd("effect give " + n + " minecraft:jump_boost infinite 200 true");
+        UUID id = p.getUUID();
+        if (!frozenModes.containsKey(id) && !p.isSpectator()) {
+            frozenModes.put(id, p.isCreative() ? GameType.CREATIVE : GameType.SURVIVAL);
+            p.setGameMode(GameType.ADVENTURE);
+        }
+    }
+
+    private static void unfreezeAll() {
+        runCmd("effect clear @a minecraft:slowness");
+        runCmd("effect clear @a minecraft:jump_boost");
+        for (Map.Entry<UUID, GameType> e : frozenModes.entrySet()) {
+            ServerPlayer p = server.getPlayerList().getPlayer(e.getKey());
+            if (p != null) {
+                p.setGameMode(e.getValue());
+            } else {
+                reviveOnJoin.add(e.getKey());
+            }
+        }
+        frozenModes.clear();
+    }
+
+    /** Полная отмена всего: таймер, ПВП, пауза, голосование + очистка и убийство всех. */
+    private static void cancelGame() {
+        running = false;
+        voteActive = false;
+        voteDone = false;
+        gameActive = false;
+        gameEndTicks = 0;
+        winnerFxTicks = 0;
+        winnerAnnounced = false;
+        bar.removeAllPlayers();
+
+        if (paused) {
+            paused = false;
+            pauseExempt = null;
+        }
+        unfreezeAll();
+
+        if (pvp) {
+            pvp = false;
+        }
+        for (UUID uuid : fallen) {
+            if (server.getPlayerList().getPlayer(uuid) == null) {
+                reviveOnJoin.add(uuid);
+            }
+        }
+        fallen.clear();
+        kills.clear();
+
+        runCmd("effect clear @a minecraft:glowing");
+        if (keepInvDisabled) {
+            setKeepInventory(true);
+        }
+        wipePlayers();
+    }
+
+    /** Нормальное завершение игры после победы. */
+    private static void finishGame() {
+        gameActive = false;
+        endPvp();
+        wipePlayers();
+        broadcast(Component.literal("🏁 Игра окончена. Инвентари очищены, все убиты.")
+                .withStyle(ChatFormatting.GOLD));
+    }
+
+    /** Всем режим выживания, очистка инвентаря, смерть. */
+    private static void wipePlayers() {
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            p.setGameMode(GameType.SURVIVAL);
+        }
+        runCmd("clear @a");
+        runCmd("kill @a");
+    }
+
+    // ------------------------------------------------------ timer commands
+
+    private static int timerStart(CommandContext<CommandSourceStack> ctx, int minutes) {
         if (running) {
             ctx.getSource().sendFailure(Component.literal("Таймер уже запущен. Используй /timer add <минуты> или /timer stop."));
             return 0;
@@ -470,6 +728,11 @@ public class TimerMod implements ModInitializer {
             return 0;
         }
         server = ctx.getSource().getServer();
+        startTimer(minutes);
+        return 1;
+    }
+
+    private static void startTimer(int minutes) {
         running = true;
         specEnabled = true;
         totalTicks = minutes * TICKS_PER_MINUTE;
@@ -490,7 +753,6 @@ public class TimerMod implements ModInitializer {
         titleAll(minutes + " МИН", "green", "Таймер запущен", "gray", "5 30 10");
         soundAll("minecraft:block.beacon.activate", "1 1");
         broadcast(Component.literal("▶ Таймер запущен на " + minutes + " мин.").withStyle(ChatFormatting.GREEN));
-        return 1;
     }
 
     private static int add(CommandContext<CommandSourceStack> ctx, int minutes) {
@@ -530,6 +792,8 @@ public class TimerMod implements ModInitializer {
     private static int specOff(CommandContext<CommandSourceStack> ctx) {
         specEnabled = false;
         server = ctx.getSource().getServer();
+        gameActive = false;
+        gameEndTicks = 0;
         if (pvp) {
             endPvp();
         } else if (running) {
@@ -552,24 +816,31 @@ public class TimerMod implements ModInitializer {
                 + (specEnabled ? "" : " (ПВП в конце не будет)");
         else if (pvp) state = "ПВП идёт, живых: " + aliveCount();
         else state = "не запущен";
+        if (paused) state += " | ПАУЗА";
         ctx.getSource().sendSuccess(() -> Component.literal("⏱ Таймер: " + state)
                 .withStyle(ChatFormatting.GOLD), false);
         return 1;
     }
 
-    /** Случайно делит игроков онлайн на team1 и team2. */
-    private static int randomTeam(CommandContext<CommandSourceStack> ctx) {
+    // ------------------------------------------------------------- teams
+
+    private static int randomTeamCmd(CommandContext<CommandSourceStack> ctx) {
         server = ctx.getSource().getServer();
         if (pvp) {
             ctx.getSource().sendFailure(Component.literal("Нельзя менять команды во время ПВП."));
             return 0;
         }
-
-        List<ServerPlayer> players = new ArrayList<>(server.getPlayerList().getPlayers());
-        if (players.size() < 2) {
+        if (!randomTeams()) {
             ctx.getSource().sendFailure(Component.literal("Для разделения на команды нужно минимум 2 игрока."));
             return 0;
         }
+        return 1;
+    }
+
+    /** Случайно делит игроков онлайн на team1 и team2. */
+    private static boolean randomTeams() {
+        List<ServerPlayer> players = new ArrayList<>(server.getPlayerList().getPlayers());
+        if (players.size() < 2) return false;
 
         Collections.shuffle(players, RANDOM);
         int n1 = players.size() / 2;
@@ -598,7 +869,7 @@ public class TimerMod implements ModInitializer {
         broadcast(Component.literal("🎲 Команды распределены случайно:").withStyle(ChatFormatting.GOLD));
         broadcast(Component.literal("🔵 team1: " + String.join(", ", t1)).withStyle(ChatFormatting.BLUE));
         broadcast(Component.literal("🔴 team2: " + String.join(", ", t2)).withStyle(ChatFormatting.RED));
-        return 1;
+        return true;
     }
 
     private static void ensureTeams() {
@@ -665,9 +936,22 @@ public class TimerMod implements ModInitializer {
     /** Если остались живыми игроки только одной команды (или один игрок) — объявляем победителей. */
     private static void checkWinners() {
         if (!pvp || winnerAnnounced || pvpStartKeys < 2) return;
-        if (aliveKeys().size() == 1) {
+        int n = aliveKeys().size();
+        if (n == 1) {
             announceWinners();
+        } else if (n == 0) {
+            announceDraw();
         }
+    }
+
+    private static void announceDraw() {
+        winnerAnnounced = true;
+        titleAll("НИЧЬЯ", "gray", "Победителей нет", "gray", "10 60 20");
+        soundAll("minecraft:entity.lightning_bolt.thunder", "0.7 0.8");
+        broadcast(Component.literal("🤝 Ничья — никого не осталось в живых.").withStyle(ChatFormatting.GRAY));
+        runCmd("effect clear @a minecraft:glowing");
+        setKeepInventory(true);
+        scheduleGameEnd();
     }
 
     private static void announceWinners() {
@@ -735,6 +1019,18 @@ public class TimerMod implements ModInitializer {
         runCmd("effect clear @a minecraft:glowing");
         setKeepInventory(true);
         broadcast(Component.literal("🔒 Сохранение инвентаря снова включено.").withStyle(ChatFormatting.GREEN));
+
+        scheduleGameEnd();
+    }
+
+    /** Если игра запущена через /game start — через несколько секунд закончить её. */
+    private static void scheduleGameEnd() {
+        if (gameActive) {
+            gameEndTicks = GAME_END_DELAY_TICKS;
+            broadcast(Component.literal("🏁 Через " + (GAME_END_DELAY_TICKS / 20)
+                    + " сек. игра закончится: инвентари очистятся, все будут убиты.")
+                    .withStyle(ChatFormatting.GRAY));
+        }
     }
 
     private static void endPvp() {
