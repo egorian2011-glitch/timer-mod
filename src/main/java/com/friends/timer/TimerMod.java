@@ -817,7 +817,8 @@ public class TimerMod implements ModInitializer {
         else if (pvp) state = "ПВП идёт, живых: " + aliveCount();
         else state = "не запущен";
         if (paused) state += " | ПАУЗА";
-        ctx.getSource().sendSuccess(() -> Component.literal("⏱ Таймер: " + state)
+        final String message = "⏱ Таймер: " + state;
+        ctx.getSource().sendSuccess(() -> Component.literal(message)
                 .withStyle(ChatFormatting.GOLD), false);
         return 1;
     }
