@@ -32,6 +32,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -57,7 +58,7 @@ public class TimerMod implements ModInitializer {
     private static final int EXTENSION_MINUTES = 2;
     private static final int VOTE_DURATION_TICKS = 20 * 20;
 
-    /** Голосования, которые запускают игроки (/voteday, /votetime). */
+    /** Голосование, которое запускает игрок (/votetime). */
     private static final int MAX_VOTE_MINUTES = 10;
     private static final int PLAYER_VOTE_COOLDOWN_TICKS = 20 * 60;
     private static final int MIN_TICKS_FOR_TIME_VOTE = 20 * 40;
@@ -78,9 +79,10 @@ public class TimerMod implements ModInitializer {
     /** Когда падает: доля прошедшего времени таймера (от и до). */
     private static final double AIRDROP_EARLIEST = 0.30;
     private static final double AIRDROP_LATEST = 0.65;
-    /** Расстояние от середины игроков до места падения. */
-    private static final int DROP_MIN_DIST = 60;
-    private static final int DROP_MAX_DIST = 160;
+    /** Радиус карты: аирдроп никогда не упадёт дальше этого от центра игры. */
+    private static final int MAP_RADIUS = 250;
+    /** Минимальное расстояние от центра до места падения. */
+    private static final int DROP_MIN_DIST = 40;
     /** Радиус площадки (9x9 при радиусе 4). */
     private static final int FORT_RADIUS = 4;
     /** Сколько тиков сундук закрыт после падения (0 — открыт сразу). 600 = 30 сек. */
@@ -88,16 +90,17 @@ public class TimerMod implements ModInitializer {
     /** Шансы типов добычи: обычная 60%, редкая 30%, остальное — джекпот (10%). */
     private static final double COMMON_CHANCE = 0.60;
     private static final double RARE_CHANCE = 0.30;
-    /** Сколько случайных наборов из пула кладётся в сундук. */
+    /** Сколько случайных позиций из списка обычной добычи кладётся в сундук. */
     private static final int COMMON_PICKS = 3;
-    private static final int RARE_PICKS = 2;
-    private static final int JACKPOT_PICKS = 1;
+
+    private static final String SPEED_POTION =
+            "minecraft:potion[potion_contents={potion:\"minecraft:swiftness\"}]";
 
     // ======================================================================
 
     private static final Random RANDOM = new Random();
 
-    private enum VoteType { AUTO_EXTEND, ADD_TIME, DAY }
+    private enum VoteType { AUTO_EXTEND, ADD_TIME }
 
     private enum DropState { NONE, SEARCHING, SPAWNED, OPENED }
 
@@ -139,6 +142,9 @@ public class TimerMod implements ModInitializer {
     private static boolean gameActive = false;
     private static int gameEndTicks = 0;
     private static int respawnRestoreTicks = 0;
+
+    // --- напоминание оператору при входе ---
+    private static final Map<UUID, Integer> opHelpAt = new HashMap<>();
 
     // --- пауза ---
     private static boolean paused = false;
@@ -186,6 +192,7 @@ public class TimerMod implements ModInitializer {
     private static int dropSearchAttempts = 0;
     private static boolean dropSpotFound = false;
     private static int dropX, dropY, dropZ;
+    private static double centerX = 0, centerZ = 0;
     private static int dropLockTicks = 0;
     private static int dropAge = 0;
     private static String dropTier = "";
@@ -194,6 +201,11 @@ public class TimerMod implements ModInitializer {
 
     private static boolean isOp(CommandSourceStack s) {
         return s.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
+    }
+
+    /** Является ли игрок оператором (уровень 2 и выше). Если проверка не соберётся — менять только эту строку. */
+    private static boolean isOpPlayer(ServerPlayer p) {
+        return p.getPermissionContext().permissionLevel().ordinal() >= 2;
     }
 
     @Override
@@ -251,11 +263,7 @@ public class TimerMod implements ModInitializer {
                             .then(Commands.literal("off").executes(ctx -> gameResume(ctx)))
             );
 
-            // Голосования, которые может запустить любой игрок
-            dispatcher.register(
-                    Commands.literal("voteday")
-                            .executes(ctx -> startPlayerVote(ctx, VoteType.DAY, 0))
-            );
+            // Голосование, которое может запустить любой игрок
             dispatcher.register(
                     Commands.literal("votetime")
                             .then(Commands.argument("minutes", IntegerArgumentType.integer(1, MAX_VOTE_MINUTES))
@@ -336,6 +344,10 @@ public class TimerMod implements ModInitializer {
             if (paused && !player.getUUID().equals(pauseExempt)) {
                 freeze(player);
             }
+            // Напоминание оператору (через 2 секунды после входа)
+            if (isOpPlayer(player)) {
+                opHelpAt.put(player.getUUID(), srv.getTickCount() + 40);
+            }
         });
 
         // Открытие сундука с аирдропом
@@ -392,6 +404,22 @@ public class TimerMod implements ModInitializer {
     private void onTick(MinecraftServer srv) {
         server = srv;
         int tick = srv.getTickCount();
+
+        // Напоминание оператору после входа
+        if (!opHelpAt.isEmpty()) {
+            for (Iterator<Map.Entry<UUID, Integer>> it = opHelpAt.entrySet().iterator(); it.hasNext(); ) {
+                Map.Entry<UUID, Integer> e = it.next();
+                if (tick >= e.getValue()) {
+                    ServerPlayer p = srv.getPlayerList().getPlayer(e.getKey());
+                    if (p != null) {
+                        for (Component c : opReminderLines()) {
+                            p.sendSystemMessage(c);
+                        }
+                    }
+                    it.remove();
+                }
+            }
+        }
 
         // Возврат правила immediate_respawn после автовозрождения
         if (respawnRestoreTicks > 0) {
@@ -621,6 +649,18 @@ public class TimerMod implements ModInitializer {
         dropArmed = false;
         dropSpotFound = false;
         timerElapsed = 0;
+
+        // Центр игры — среднее положение игроков в момент запуска (около точки спавна)
+        double sx = 0, sz = 0;
+        int n = 0;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            sx += p.getX();
+            sz += p.getZ();
+            n++;
+        }
+        centerX = n > 0 ? sx / n : 0;
+        centerZ = n > 0 ? sz / n : 0;
+
         if (!AIRDROP_ENABLED || totalTicks < AIRDROP_MIN_TIMER_MINUTES * TICKS_PER_MINUTE) return;
 
         double f = AIRDROP_EARLIEST + RANDOM.nextDouble() * (AIRDROP_LATEST - AIRDROP_EARLIEST);
@@ -676,28 +716,17 @@ public class TimerMod implements ModInitializer {
         return level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
     }
 
-    /** Одна попытка найти ровное сухое место на поверхности. */
+    /** Одна попытка найти ровное сухое место на поверхности внутри радиуса карты. */
     private static boolean tryFindSpot() {
         ServerLevel level = server.overworld();
 
-        double cx = 0, cz = 0;
-        int n = 0;
-        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-            if (!p.isSpectator()) {
-                cx += p.getX();
-                cz += p.getZ();
-                n++;
-            }
-        }
-        if (n > 0) {
-            cx /= n;
-            cz /= n;
-        }
-
+        int maxDist = MAP_RADIUS - FORT_RADIUS - 15;
+        double minD = DROP_MIN_DIST;
+        // sqrt — чтобы точки были распределены равномерно по площади, а не скучились у центра
+        double dist = Math.sqrt(minD * minD + RANDOM.nextDouble() * ((double) maxDist * maxDist - minD * minD));
         double ang = RANDOM.nextDouble() * Math.PI * 2;
-        double dist = DROP_MIN_DIST + RANDOM.nextDouble() * (DROP_MAX_DIST - DROP_MIN_DIST);
-        int x = (int) Math.round(cx + Math.cos(ang) * dist);
-        int z = (int) Math.round(cz + Math.sin(ang) * dist);
+        int x = (int) Math.round(centerX + Math.cos(ang) * dist);
+        int z = (int) Math.round(centerZ + Math.sin(ang) * dist);
 
         int r = FORT_RADIUS;
         int y = surfaceY(level, x, z);
@@ -810,7 +839,7 @@ public class TimerMod implements ModInitializer {
     private static List<String[]> rollLoot() {
         List<String[]> out = new ArrayList<>();
 
-        // Еда — всегда
+        // Еда — всегда: золотое яблоко (1–2) или жареное мясо (8–16)
         if (RANDOM.nextBoolean()) {
             out.add(item("minecraft:golden_apple", 1 + RANDOM.nextInt(2)));
         } else {
@@ -819,6 +848,7 @@ public class TimerMod implements ModInitializer {
 
         double r = RANDOM.nextDouble();
         if (r < COMMON_CHANCE) {
+            // ОБЫЧНЫЙ: несколько случайных позиций из списка
             dropTier = "ОБЫЧНАЯ";
             List<List<String[]>> pool = new ArrayList<>();
             pool.add(bundle(item("minecraft:bow", 1), item("minecraft:arrow", 16)));
@@ -831,23 +861,32 @@ public class TimerMod implements ModInitializer {
             pool.add(bundle(item(RANDOM.nextBoolean() ? "minecraft:oak_planks" : "minecraft:stone", 32)));
             addPicks(pool, COMMON_PICKS, out);
         } else if (r < COMMON_CHANCE + RARE_CHANCE) {
+            // РЕДКИЙ: вариант А или Б (50/50), в обоих — жемчуг и зелье скорости
             dropTier = "РЕДКАЯ";
-            List<List<String[]>> pool = new ArrayList<>();
-            pool.add(bundle(item("minecraft:diamond_chestplate", 1)));
-            List<String> diamonds = new ArrayList<>(List.of("minecraft:diamond_helmet",
-                    "minecraft:diamond_leggings", "minecraft:diamond_boots", "minecraft:diamond_sword",
-                    "minecraft:diamond_pickaxe", "minecraft:diamond_axe"));
-            Collections.shuffle(diamonds, RANDOM);
-            pool.add(bundle(item(diamonds.get(0), 1), item(diamonds.get(1), 1)));
-            pool.add(bundle(item("minecraft:ender_pearl", 1)));
-            pool.add(bundle(item("minecraft:potion[potion_contents={potion:\"minecraft:swiftness\"}]", 1)));
-            addPicks(pool, RARE_PICKS, out);
+            if (RANDOM.nextBoolean()) {
+                out.add(item("minecraft:diamond_chestplate", 1));
+            } else {
+                List<String> diamonds = new ArrayList<>(List.of("minecraft:diamond_helmet",
+                        "minecraft:diamond_leggings", "minecraft:diamond_boots", "minecraft:diamond_sword",
+                        "minecraft:diamond_pickaxe", "minecraft:diamond_axe"));
+                Collections.shuffle(diamonds, RANDOM);
+                out.add(item(diamonds.get(0), 1));
+                out.add(item(diamonds.get(1), 1));
+            }
+            out.add(item("minecraft:ender_pearl", 1));
+            out.add(item(SPEED_POTION, 1));
         } else {
+            // ДЖЕКПОТ: вариант А или Б (50/50)
             dropTier = "ДЖЕКПОТ";
-            List<List<String[]>> pool = new ArrayList<>();
-            pool.add(bundle(item("minecraft:diamond_chestplate", 1), item("minecraft:diamond_leggings", 1)));
-            pool.add(bundle(item("minecraft:enchanted_golden_apple", 1), item("minecraft:diamond_sword", 1)));
-            addPicks(pool, JACKPOT_PICKS, out);
+            if (RANDOM.nextBoolean()) {
+                out.add(item("minecraft:diamond_chestplate", 1));
+                out.add(item("minecraft:diamond_leggings", 1));
+            } else {
+                out.add(item("minecraft:enchanted_golden_apple", 1));
+                out.add(item("minecraft:diamond_sword", 1));
+                out.add(item("minecraft:diamond_leggings", 1));
+                out.add(item("minecraft:diamond_boots", 1));
+            }
         }
         return out;
     }
@@ -951,7 +990,7 @@ public class TimerMod implements ModInitializer {
 
     // ------------------------------------------------------------ voting
 
-    /** Запуск голосования, которое начал игрок (/voteday, /votetime). */
+    /** Запуск голосования, которое начал игрок (/votetime). */
     private static int startPlayerVote(CommandContext<CommandSourceStack> ctx, VoteType type, int minutes) {
         server = ctx.getSource().getServer();
         ServerPlayer player = ctx.getSource().getPlayer();
@@ -976,20 +1015,13 @@ public class TimerMod implements ModInitializer {
             return 0;
         }
 
-        if (type == VoteType.DAY) {
-            if (pvp) {
-                ctx.getSource().sendFailure(Component.literal("Во время ПВП и так всегда день."));
-                return 0;
-            }
-        } else if (type == VoteType.ADD_TIME) {
-            if (!running) {
-                ctx.getSource().sendFailure(Component.literal("Таймер сейчас не идёт."));
-                return 0;
-            }
-            if (remainingTicks < MIN_TICKS_FOR_TIME_VOTE) {
-                ctx.getSource().sendFailure(Component.literal("До конца таймера слишком мало времени для голосования."));
-                return 0;
-            }
+        if (!running) {
+            ctx.getSource().sendFailure(Component.literal("Таймер сейчас не идёт."));
+            return 0;
+        }
+        if (remainingTicks < MIN_TICKS_FOR_TIME_VOTE) {
+            ctx.getSource().sendFailure(Component.literal("До конца таймера слишком мало времени для голосования."));
+            return 0;
         }
 
         lastPlayerVoteTick = now;
@@ -1004,14 +1036,9 @@ public class TimerMod implements ModInitializer {
         voteTicksLeft = VOTE_DURATION_TICKS;
         votes.clear();
 
-        String question;
-        if (type == VoteType.DAY) {
-            question = "Включить день?";
-        } else if (type == VoteType.ADD_TIME) {
-            question = "Добавить " + minutes + " мин?";
-        } else {
-            question = "Продлить на " + minutes + " мин?";
-        }
+        String question = type == VoteType.ADD_TIME
+                ? "Добавить " + minutes + " мин?"
+                : "Продлить на " + minutes + " мин?";
 
         titleAll("ГОЛОСОВАНИЕ", "gold", question, "yellow", "5 50 10");
         soundAll("minecraft:block.note_block.bell", "1 1");
@@ -1084,18 +1111,6 @@ public class TimerMod implements ModInitializer {
             stats = "ДА: " + yes + " (" + pYes + "%) | НЕТ: " + no + " (" + (100 - pYes) + "%).";
         }
         broadcast(Component.literal("🗳 Итоги: " + stats + note).withStyle(ChatFormatting.GOLD));
-
-        if (type == VoteType.DAY) {
-            if (pass) {
-                runCmd("time set day");
-                soundAll("minecraft:entity.player.levelup", "1 1");
-                broadcast(Component.literal("☀ Включён день.").withStyle(ChatFormatting.GREEN));
-            } else {
-                soundAll("minecraft:block.note_block.bass", "1 0.7");
-                broadcast(Component.literal("🌙 День не включён.").withStyle(ChatFormatting.YELLOW));
-            }
-            return;
-        }
 
         if (type == VoteType.ADD_TIME) {
             if (pass && running) {
@@ -1187,8 +1202,7 @@ public class TimerMod implements ModInitializer {
         return Component.literal(text).withStyle(format);
     }
 
-    /** Таблица с командами: для игроков и для оператора. */
-    private static List<Component> helpLines() {
+    private static List<Component> rulesLines() {
         List<Component> l = new ArrayList<>();
         l.add(line("━━━━━━━━━━━ КАК ИГРАТЬ ━━━━━━━━━━━", ChatFormatting.GOLD));
         l.add(line("Пока идёт таймер — умирай и возрождайся как обычно.", ChatFormatting.GRAY));
@@ -1196,17 +1210,22 @@ public class TimerMod implements ModInitializer {
         l.add(line("Побеждает команда, в которой остались живые.", ChatFormatting.GRAY));
         l.add(line("Во время таймера в случайном месте упадёт аирдроп с добычей — найди его первым!",
                 ChatFormatting.LIGHT_PURPLE));
-        l.add(line(" ", ChatFormatting.WHITE));
+        return l;
+    }
 
+    private static List<Component> playerCommandLines() {
+        List<Component> l = new ArrayList<>();
         l.add(line("👥 ДЛЯ ИГРОКОВ:", ChatFormatting.GREEN));
         l.add(line("  /vote yes  или  /vote no — голосовать (или кнопки [ДА] [НЕТ] в чате)", ChatFormatting.WHITE));
-        l.add(line("  /voteday — голосование: включить день", ChatFormatting.WHITE));
         l.add(line("  /votetime <1-" + MAX_VOTE_MINUTES + "> — голосование: добавить минуты к таймеру",
                 ChatFormatting.WHITE));
         l.add(line("  За минуту до конца таймера само пройдёт голосование за +" + EXTENSION_MINUTES
                 + " мин (до " + MAX_EXTENSIONS + " раз).", ChatFormatting.GRAY));
-        l.add(line(" ", ChatFormatting.WHITE));
+        return l;
+    }
 
+    private static List<Component> opCommandLines() {
+        List<Component> l = new ArrayList<>();
         l.add(line("🛠 ДЛЯ ОПЕРАТОРА — порядок, чтобы начать игру:", ChatFormatting.AQUA));
         l.add(line("  1. /playerpause — заморозить всех (кроме тебя)", ChatFormatting.WHITE));
         l.add(line("  2. /setworldspawn — точка возрождения там, где ты стоишь", ChatFormatting.WHITE));
@@ -1216,6 +1235,26 @@ public class TimerMod implements ModInitializer {
         l.add(line("  Снять паузу вручную: /game resume  или  /playerpause off", ChatFormatting.GRAY));
         l.add(line("  Прочее: /game pause, /game delete, /game help,", ChatFormatting.WHITE));
         l.add(line("  /timer (статус), /timer add|start|stop <мин>, /timer spec off", ChatFormatting.WHITE));
+        return l;
+    }
+
+    /** Напоминание оператору при заходе на сервер. */
+    private static List<Component> opReminderLines() {
+        List<Component> l = new ArrayList<>();
+        l.add(line("━━━━━━━ НАПОМИНАНИЕ ОПЕРАТОРУ ━━━━━━━", ChatFormatting.GOLD));
+        l.addAll(opCommandLines());
+        l.add(line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ChatFormatting.GOLD));
+        return l;
+    }
+
+    /** Таблица с командами: для игроков и для оператора. */
+    private static List<Component> helpLines() {
+        List<Component> l = new ArrayList<>();
+        l.addAll(rulesLines());
+        l.add(line(" ", ChatFormatting.WHITE));
+        l.addAll(playerCommandLines());
+        l.add(line(" ", ChatFormatting.WHITE));
+        l.addAll(opCommandLines());
         l.add(line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ChatFormatting.GOLD));
         return l;
     }
