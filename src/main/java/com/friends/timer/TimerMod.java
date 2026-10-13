@@ -8,20 +8,28 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.entity.event.v1.ServerPlayerEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerBossEvent;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.permissions.Permissions;
 import net.minecraft.world.BossEvent;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -34,16 +42,25 @@ import java.util.UUID;
 
 public class TimerMod implements ModInitializer {
 
+    // ======================================================================
+    //                              НАСТРОЙКИ
+    // ======================================================================
+
     /** Надпись по центру экрана, когда таймер закончился. */
     private static final String PVP_TITLE = "ПВП НАЧИНАЕТСЯ";
     private static final String PVP_SUBTITLE = "Погибшие становятся спектаторами";
 
     private static final int TICKS_PER_MINUTE = 20 * 60;
 
-    /** Голосование за продление. */
+    /** Автоматическое голосование за продление в последнюю минуту. */
     private static final int MAX_EXTENSIONS = 3;
     private static final int EXTENSION_MINUTES = 2;
     private static final int VOTE_DURATION_TICKS = 20 * 20;
+
+    /** Голосования, которые запускают игроки (/voteday, /votetime). */
+    private static final int MAX_VOTE_MINUTES = 10;
+    private static final int PLAYER_VOTE_COOLDOWN_TICKS = 20 * 60;
+    private static final int MIN_TICKS_FOR_TIME_VOTE = 20 * 40;
 
     /** Через сколько тиков ПВП все начинают светиться (5 минут). */
     private static final int GLOW_AFTER_TICKS = 5 * TICKS_PER_MINUTE;
@@ -51,7 +68,57 @@ public class TimerMod implements ModInitializer {
     /** Через сколько тиков после победы игра заканчивается (очистка и убийство). 200 = 10 сек. */
     private static final int GAME_END_DELAY_TICKS = 20 * 10;
 
+    /** Значение правила immediate_respawn, которое возвращается после автовозрождения. */
+    private static final boolean IMMEDIATE_RESPAWN_DEFAULT = false;
+
+    // --- аирдроп ---
+    private static final boolean AIRDROP_ENABLED = true;
+    /** Аирдроп появляется только если таймер не короче этого. */
+    private static final int AIRDROP_MIN_TIMER_MINUTES = 5;
+    /** Когда падает: доля прошедшего времени таймера (от и до). */
+    private static final double AIRDROP_EARLIEST = 0.30;
+    private static final double AIRDROP_LATEST = 0.65;
+    /** Расстояние от середины игроков до места падения. */
+    private static final int DROP_MIN_DIST = 60;
+    private static final int DROP_MAX_DIST = 160;
+    /** Радиус площадки (9x9 при радиусе 4). */
+    private static final int FORT_RADIUS = 4;
+    /** Сколько тиков сундук закрыт после падения (0 — открыт сразу). 600 = 30 сек. */
+    private static final int CHEST_LOCK_TICKS = 20 * 30;
+    /** Шансы типов добычи: обычная 60%, редкая 30%, остальное — джекпот (10%). */
+    private static final double COMMON_CHANCE = 0.60;
+    private static final double RARE_CHANCE = 0.30;
+    /** Сколько случайных наборов из пула кладётся в сундук. */
+    private static final int COMMON_PICKS = 3;
+    private static final int RARE_PICKS = 2;
+    private static final int JACKPOT_PICKS = 1;
+
+    // ======================================================================
+
     private static final Random RANDOM = new Random();
+
+    private enum VoteType { AUTO_EXTEND, ADD_TIME, DAY }
+
+    private enum DropState { NONE, SEARCHING, SPAWNED, OPENED }
+
+    /** Нота для мини-музыки при открытии сундука. */
+    private record Note(int tick, String sound, double pitch) {}
+
+    private static final Note[] JINGLE = {
+            new Note(0, "minecraft:ui.toast.challenge_complete", 1.0),
+            new Note(0, "minecraft:entity.firework_rocket.launch", 1.0),
+            new Note(4, "minecraft:block.note_block.bell", 0.75),
+            new Note(7, "minecraft:block.note_block.bell", 0.945),
+            new Note(10, "minecraft:block.note_block.bell", 1.125),
+            new Note(13, "minecraft:block.note_block.bell", 1.5),
+            new Note(18, "minecraft:block.note_block.bell", 0.75),
+            new Note(18, "minecraft:block.note_block.bell", 1.125),
+            new Note(18, "minecraft:block.note_block.chime", 1.5),
+            new Note(18, "minecraft:entity.firework_rocket.blast", 1.0),
+            new Note(18, "minecraft:entity.firework_rocket.twinkle", 1.0),
+            new Note(24, "minecraft:entity.firework_rocket.twinkle", 1.2),
+            new Note(30, "minecraft:entity.player.levelup", 1.0),
+    };
 
     private static MinecraftServer server;
     private static ServerBossEvent bar;
@@ -65,10 +132,13 @@ public class TimerMod implements ModInitializer {
 
     private static int remainingTicks = 0;
     private static int totalTicks = 0;
+    /** Сколько тиков таймера уже прошло (без пауз). */
+    private static int timerElapsed = 0;
 
     // --- игра (/game start) ---
     private static boolean gameActive = false;
     private static int gameEndTicks = 0;
+    private static int respawnRestoreTicks = 0;
 
     // --- пауза ---
     private static boolean paused = false;
@@ -77,17 +147,24 @@ public class TimerMod implements ModInitializer {
     /** Кого заморозили и в каком режиме он был (SURVIVAL или CREATIVE). */
     private static final Map<UUID, GameType> frozenModes = new HashMap<>();
 
-    // --- голосование ---
+    // --- голосования ---
     private static boolean voteActive = false;
-    private static boolean voteDone = false;
+    private static boolean voteDone = false; // автоголосование уже было отклонено
+    private static VoteType voteType = VoteType.AUTO_EXTEND;
+    private static int voteMinutes = 0;
     private static int voteTicksLeft = 0;
     private static int extensionsUsed = 0;
+    private static int lastPlayerVoteTick = -PLAYER_VOTE_COOLDOWN_TICKS;
     private static final Map<UUID, Boolean> votes = new HashMap<>();
 
     // --- ПВП ---
     private static final Set<UUID> fallen = new HashSet<>();
     private static final Set<UUID> reviveOnJoin = new HashSet<>();
     private static final Map<String, Integer> kills = new HashMap<>();
+
+    /** Для итогов: порядок выбывания и первая кровь. */
+    private static final List<String> deathLog = new ArrayList<>();
+    private static String firstBlood = null;
 
     private static int pvpStartKeys = 0;
     private static int pvpStartPlayers = 0;
@@ -101,6 +178,20 @@ public class TimerMod implements ModInitializer {
     /** true, если мод сейчас отключил сохранение инвентаря и должен его вернуть. */
     private static boolean keepInvDisabled = false;
 
+    // --- аирдроп ---
+    private static boolean dropArmed = false;
+    private static DropState dropState = DropState.NONE;
+    private static int dropTriggerTick = 0;
+    private static int dropWarnTick = 0;
+    private static int dropSearchAttempts = 0;
+    private static boolean dropSpotFound = false;
+    private static int dropX, dropY, dropZ;
+    private static int dropLockTicks = 0;
+    private static int dropAge = 0;
+    private static String dropTier = "";
+    private static boolean jingleActive = false;
+    private static int jingleTick = 0;
+
     private static boolean isOp(CommandSourceStack s) {
         return s.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
     }
@@ -111,27 +202,28 @@ public class TimerMod implements ModInitializer {
                 BossEvent.BossBarColor.GREEN, BossEvent.BossBarOverlay.PROGRESS);
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            // /timer — только для операторов
             dispatcher.register(
                     Commands.literal("timer")
+                            .requires(TimerMod::isOp)
                             .executes(ctx -> status(ctx))
                             .then(Commands.literal("start")
-                                    .requires(TimerMod::isOp)
                                     .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
                                             .executes(ctx -> timerStart(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
                             .then(Commands.literal("add")
-                                    .requires(TimerMod::isOp)
                                     .then(Commands.argument("minutes", IntegerArgumentType.integer(1, 1440))
                                             .executes(ctx -> add(ctx, IntegerArgumentType.getInteger(ctx, "minutes")))))
                             .then(Commands.literal("stop")
-                                    .requires(TimerMod::isOp)
                                     .executes(ctx -> stop(ctx)))
                             .then(Commands.literal("spec")
-                                    .requires(TimerMod::isOp)
                                     .then(Commands.literal("off").executes(ctx -> specOff(ctx))))
-                            // голосовать может любой игрок
-                            .then(Commands.literal("vote")
-                                    .then(Commands.literal("yes").executes(ctx -> vote(ctx, true)))
-                                    .then(Commands.literal("no").executes(ctx -> vote(ctx, false))))
+            );
+
+            // Голосовать может любой игрок
+            dispatcher.register(
+                    Commands.literal("vote")
+                            .then(Commands.literal("yes").executes(ctx -> vote(ctx, true)))
+                            .then(Commands.literal("no").executes(ctx -> vote(ctx, false)))
             );
 
             dispatcher.register(
@@ -149,6 +241,7 @@ public class TimerMod implements ModInitializer {
                             .then(Commands.literal("delete").executes(ctx -> gameDelete(ctx)))
                             .then(Commands.literal("pause").executes(ctx -> gamePause(ctx)))
                             .then(Commands.literal("resume").executes(ctx -> gameResume(ctx)))
+                            .then(Commands.literal("help").executes(ctx -> gameHelp(ctx)))
             );
 
             dispatcher.register(
@@ -156,6 +249,18 @@ public class TimerMod implements ModInitializer {
                             .requires(TimerMod::isOp)
                             .executes(ctx -> playerPause(ctx))
                             .then(Commands.literal("off").executes(ctx -> gameResume(ctx)))
+            );
+
+            // Голосования, которые может запустить любой игрок
+            dispatcher.register(
+                    Commands.literal("voteday")
+                            .executes(ctx -> startPlayerVote(ctx, VoteType.DAY, 0))
+            );
+            dispatcher.register(
+                    Commands.literal("votetime")
+                            .then(Commands.argument("minutes", IntegerArgumentType.integer(1, MAX_VOTE_MINUTES))
+                                    .executes(ctx -> startPlayerVote(ctx, VoteType.ADD_TIME,
+                                            IntegerArgumentType.getInteger(ctx, "minutes"))))
             );
         });
 
@@ -176,9 +281,10 @@ public class TimerMod implements ModInitializer {
             if (!fallen.add(victim.getUUID())) return;
 
             String victimName = victim.getName().getString();
+            String killerName = null;
             Component msg;
             if (source.getEntity() instanceof ServerPlayer killer && killer != victim) {
-                String killerName = killer.getName().getString();
+                killerName = killer.getName().getString();
                 kills.merge(killerName, 1, Integer::sum);
                 msg = Component.literal("☠ " + victimName + " убит игроком " + killerName)
                         .withStyle(ChatFormatting.RED);
@@ -186,6 +292,15 @@ public class TimerMod implements ModInitializer {
                 msg = Component.literal("☠ " + victimName + " погиб")
                         .withStyle(ChatFormatting.RED);
             }
+
+            // Для итогов игры
+            if (firstBlood == null) {
+                firstBlood = killerName != null
+                        ? killerName + " убил " + victimName
+                        : victimName + " погиб первым";
+            }
+            deathLog.add(victimName);
+
             broadcast(msg);
             soundAll("minecraft:entity.lightning_bolt.thunder", "0.8 1");
 
@@ -223,10 +338,40 @@ public class TimerMod implements ModInitializer {
             }
         });
 
+        // Открытие сундука с аирдропом
+        UseBlockCallback.EVENT.register((player, level, hand, hit) -> {
+            if (!(player instanceof ServerPlayer sp)) return InteractionResult.PASS;
+            if (dropState != DropState.SPAWNED) return InteractionResult.PASS;
+            BlockPos bp = hit.getBlockPos();
+            if (bp.getX() != dropX || bp.getY() != dropY || bp.getZ() != dropZ) return InteractionResult.PASS;
+
+            if (dropLockTicks > 0) {
+                int sec = (dropLockTicks + 19) / 20;
+                runCmd("title " + sp.getName().getString() + " actionbar "
+                        + "{\"text\":\"🔒 Сундук откроется через " + sec + " сек.\",\"color\":\"yellow\"}");
+                return InteractionResult.FAIL;
+            }
+            onDropOpened(sp);
+            return InteractionResult.PASS;
+        });
+
+        // Сундук нельзя сломать, пока его не открыли
+        PlayerBlockBreakEvents.BEFORE.register((level, player, pos, state, blockEntity) -> {
+            if (dropState == DropState.SPAWNED
+                    && pos.getX() == dropX && pos.getY() == dropY && pos.getZ() == dropZ) {
+                return false;
+            }
+            return true;
+        });
+
         ServerLifecycleEvents.SERVER_STOPPING.register(srv -> {
             server = srv;
             if (keepInvDisabled) {
                 setKeepInventory(true);
+            }
+            if (respawnRestoreTicks > 0) {
+                runCmd("gamerule immediate_respawn " + IMMEDIATE_RESPAWN_DEFAULT);
+                respawnRestoreTicks = 0;
             }
             if (paused) {
                 unfreezeAll();
@@ -247,6 +392,14 @@ public class TimerMod implements ModInitializer {
     private void onTick(MinecraftServer srv) {
         server = srv;
         int tick = srv.getTickCount();
+
+        // Возврат правила immediate_respawn после автовозрождения
+        if (respawnRestoreTicks > 0) {
+            respawnRestoreTicks--;
+            if (respawnRestoreTicks == 0) {
+                runCmd("gamerule immediate_respawn " + IMMEDIATE_RESPAWN_DEFAULT);
+            }
+        }
 
         // Пауза: ничего не идёт, все заморожены
         if (paused) {
@@ -274,8 +427,17 @@ public class TimerMod implements ModInitializer {
             }
         }
 
+        // Эффекты аирдропа и музыка
+        if (dropState == DropState.SPAWNED) {
+            airdropEffects(tick);
+        }
+        if (jingleActive) {
+            jingleStep();
+        }
+
         if (running) {
             remainingTicks--;
+            timerElapsed++;
             if (remainingTicks <= 0) {
                 voteActive = false;
                 finish();
@@ -287,19 +449,22 @@ public class TimerMod implements ModInitializer {
                 countdown(remainingTicks / 20);
             }
 
+            airdropSchedule(tick);
+
             // За минуту до конца — голосование за продление
             if (!voteActive && !voteDone
                     && extensionsUsed < MAX_EXTENSIONS
                     && totalTicks > TICKS_PER_MINUTE
                     && remainingTicks <= TICKS_PER_MINUTE) {
-                startVote();
+                beginVote(VoteType.AUTO_EXTEND, EXTENSION_MINUTES, null);
             }
+        }
 
-            if (voteActive) {
-                voteTicksLeft--;
-                if (voteTicksLeft <= 0) {
-                    resolveVote();
-                }
+        // Любое голосование (автоматическое или запущенное игроком)
+        if (voteActive) {
+            voteTicksLeft--;
+            if (voteTicksLeft <= 0) {
+                resolveVote();
             }
         }
 
@@ -448,24 +613,424 @@ public class TimerMod implements ModInitializer {
         return ChatFormatting.GOLD;
     }
 
+    // ------------------------------------------------------------ airdrop
+
+    /** Планирование аирдропа в начале таймера. */
+    private static void scheduleAirdrop() {
+        dropState = DropState.NONE;
+        dropArmed = false;
+        dropSpotFound = false;
+        timerElapsed = 0;
+        if (!AIRDROP_ENABLED || totalTicks < AIRDROP_MIN_TIMER_MINUTES * TICKS_PER_MINUTE) return;
+
+        double f = AIRDROP_EARLIEST + RANDOM.nextDouble() * (AIRDROP_LATEST - AIRDROP_EARLIEST);
+        dropTriggerTick = (int) (totalTicks * f);
+        dropWarnTick = Math.max(0, dropTriggerTick - TICKS_PER_MINUTE);
+        dropArmed = true;
+    }
+
+    private static void resetAirdrop() {
+        dropArmed = false;
+        dropState = DropState.NONE;
+        dropSpotFound = false;
+    }
+
+    /** Предупреждение за минуту, поиск места, падение в нужный момент. */
+    private static void airdropSchedule(int tick) {
+        if (!dropArmed) return;
+
+        if (dropState == DropState.NONE && timerElapsed >= dropWarnTick) {
+            dropState = DropState.SEARCHING;
+            dropSearchAttempts = 0;
+            dropSpotFound = false;
+            broadcast(Component.literal("📦 Примерно через минуту в случайном месте упадёт АИРДРОП!")
+                    .withStyle(ChatFormatting.LIGHT_PURPLE));
+            soundAll("minecraft:block.note_block.pling", "1 0.8");
+        }
+
+        if (dropState == DropState.SEARCHING) {
+            // Ищем место заранее, по одной попытке раз в полсекунды, чтобы не было лагов
+            if (!dropSpotFound && tick % 10 == 0 && dropSearchAttempts < 30) {
+                dropSearchAttempts++;
+                dropSpotFound = tryFindSpot();
+            }
+
+            if (timerElapsed >= dropTriggerTick) {
+                int extra = 0;
+                while (!dropSpotFound && extra < 6) {
+                    extra++;
+                    dropSpotFound = tryFindSpot();
+                }
+                if (dropSpotFound) {
+                    spawnAirdrop();
+                } else {
+                    broadcast(Component.literal("📦 Аирдроп не удалось поставить: не нашлось подходящего места.")
+                            .withStyle(ChatFormatting.GRAY));
+                    resetAirdrop();
+                }
+            }
+        }
+    }
+
+    private static int surfaceY(ServerLevel level, int x, int z) {
+        return level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+    }
+
+    /** Одна попытка найти ровное сухое место на поверхности. */
+    private static boolean tryFindSpot() {
+        ServerLevel level = server.overworld();
+
+        double cx = 0, cz = 0;
+        int n = 0;
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (!p.isSpectator()) {
+                cx += p.getX();
+                cz += p.getZ();
+                n++;
+            }
+        }
+        if (n > 0) {
+            cx /= n;
+            cz /= n;
+        }
+
+        double ang = RANDOM.nextDouble() * Math.PI * 2;
+        double dist = DROP_MIN_DIST + RANDOM.nextDouble() * (DROP_MAX_DIST - DROP_MIN_DIST);
+        int x = (int) Math.round(cx + Math.cos(ang) * dist);
+        int z = (int) Math.round(cz + Math.sin(ang) * dist);
+
+        int r = FORT_RADIUS;
+        int y = surfaceY(level, x, z);
+        int[][] pts = {{x, z}, {x - r, z - r}, {x + r, z - r}, {x - r, z + r}, {x + r, z + r}};
+        int min = Integer.MAX_VALUE;
+        int max = Integer.MIN_VALUE;
+        for (int[] pt : pts) {
+            int h = surfaceY(level, pt[0], pt[1]);
+            BlockState below = level.getBlockState(new BlockPos(pt[0], h - 1, pt[1]));
+            // Не вода, не лава и не пустота
+            if (below.isAir() || !below.getFluidState().isEmpty()) return false;
+            min = Math.min(min, h);
+            max = Math.max(max, h);
+        }
+        // Слишком крутой склон
+        if (max - min > 4) return false;
+
+        dropX = x;
+        dropY = y;
+        dropZ = z;
+        return true;
+    }
+
+    private static String fill(int x1, int y1, int z1, int x2, int y2, int z2, String block) {
+        return "fill " + x1 + " " + y1 + " " + z1 + " " + x2 + " " + y2 + " " + z2 + " " + block;
+    }
+
+    /** Строит площадку с бедроковыми стенами, ставит сундук и кладёт лут. */
+    private static void spawnAirdrop() {
+        ServerLevel level = server.overworld();
+        int x = dropX, y = dropY, z = dropZ;
+        int r = FORT_RADIUS;
+        int x1 = x - r, x2 = x + r, z1 = z - r, z2 = z + r;
+
+        // Убедиться, что вся площадка загружена
+        for (int cx = x1 >> 4; cx <= (x2 >> 4); cx++) {
+            for (int cz = z1 >> 4; cz <= (z2 >> 4); cz++) {
+                level.getChunk(cx, cz);
+            }
+        }
+
+        int wallBottom = y - 4;
+        int wallTop = y + 3;
+
+        // Чистим внутри, делаем основание и пол
+        runCmd(fill(x1 + 1, y, z1 + 1, x2 - 1, y + 5, z2 - 1, "minecraft:air"));
+        runCmd(fill(x1, y - 4, z1, x2, y - 2, z2, "minecraft:stone"));
+        runCmd(fill(x1 + 1, y - 1, z1 + 1, x2 - 1, y - 1, z2 - 1, "minecraft:smooth_stone"));
+
+        // Бедроковые стены
+        runCmd(fill(x1, wallBottom, z1, x2, wallTop, z1, "minecraft:bedrock"));
+        runCmd(fill(x1, wallBottom, z2, x2, wallTop, z2, "minecraft:bedrock"));
+        runCmd(fill(x1, wallBottom, z1 + 1, x1, wallTop, z2 - 1, "minecraft:bedrock"));
+        runCmd(fill(x2, wallBottom, z1 + 1, x2, wallTop, z2 - 1, "minecraft:bedrock"));
+
+        // Два прохода: с севера и с юга
+        runCmd(fill(x, y, z1, x, y + 2, z1, "minecraft:air"));
+        runCmd(fill(x, y, z2, x, y + 2, z2, "minecraft:air"));
+
+        // Фонари по углам
+        runCmd("setblock " + (x1 + 1) + " " + y + " " + (z1 + 1) + " minecraft:lantern");
+        runCmd("setblock " + (x2 - 1) + " " + y + " " + (z1 + 1) + " minecraft:lantern");
+        runCmd("setblock " + (x1 + 1) + " " + y + " " + (z2 - 1) + " minecraft:lantern");
+        runCmd("setblock " + (x2 - 1) + " " + y + " " + (z2 - 1) + " minecraft:lantern");
+
+        // Сундук и лут
+        runCmd("setblock " + x + " " + y + " " + z + " minecraft:chest");
+        fillChest();
+
+        dropState = DropState.SPAWNED;
+        dropLockTicks = CHEST_LOCK_TICKS;
+        dropAge = 0;
+
+        titleAll("📦 АИРДРОП", "light_purple", "X: " + x + "  Y: " + y + "  Z: " + z, "yellow", "10 80 20");
+        soundAll("minecraft:entity.lightning_bolt.thunder", "1 1.2");
+        soundAll("minecraft:block.beacon.activate", "1 1");
+        broadcast(Component.literal("📦 АИРДРОП УПАЛ! Координаты: X " + x + "  Y " + y + "  Z " + z)
+                .withStyle(ChatFormatting.LIGHT_PURPLE));
+        if (CHEST_LOCK_TICKS > 0) {
+            broadcast(Component.literal("🔒 Сундук откроется через " + (CHEST_LOCK_TICKS / 20)
+                    + " сек. Бегите к нему!").withStyle(ChatFormatting.YELLOW));
+        }
+    }
+
+    // --- лут ---
+
+    private static String[] item(String id, int count) {
+        return new String[]{id, String.valueOf(count)};
+    }
+
+    @SafeVarargs
+    private static List<String[]> bundle(String[]... items) {
+        List<String[]> l = new ArrayList<>();
+        Collections.addAll(l, items);
+        return l;
+    }
+
+    private static <T> T pickOne(List<T> list) {
+        return list.get(RANDOM.nextInt(list.size()));
+    }
+
+    /** Берёт picks случайных наборов из пула и добавляет их предметы в out. */
+    private static void addPicks(List<List<String[]>> pool, int picks, List<String[]> out) {
+        Collections.shuffle(pool, RANDOM);
+        for (int i = 0; i < Math.min(picks, pool.size()); i++) {
+            out.addAll(pool.get(i));
+        }
+    }
+
+    private static List<String[]> rollLoot() {
+        List<String[]> out = new ArrayList<>();
+
+        // Еда — всегда
+        if (RANDOM.nextBoolean()) {
+            out.add(item("minecraft:golden_apple", 1 + RANDOM.nextInt(2)));
+        } else {
+            out.add(item("minecraft:cooked_beef", 8 + RANDOM.nextInt(9)));
+        }
+
+        double r = RANDOM.nextDouble();
+        if (r < COMMON_CHANCE) {
+            dropTier = "ОБЫЧНАЯ";
+            List<List<String[]>> pool = new ArrayList<>();
+            pool.add(bundle(item("minecraft:bow", 1), item("minecraft:arrow", 16)));
+            pool.add(bundle(item("minecraft:shield", 1)));
+            List<String> iron = List.of("minecraft:iron_helmet", "minecraft:iron_chestplate",
+                    "minecraft:iron_leggings", "minecraft:iron_boots");
+            pool.add(bundle(item(pickOne(iron), 1)));
+            pool.add(bundle(item("minecraft:water_bucket", 1)));
+            pool.add(bundle(item("minecraft:cobweb", 3)));
+            pool.add(bundle(item(RANDOM.nextBoolean() ? "minecraft:oak_planks" : "minecraft:stone", 32)));
+            addPicks(pool, COMMON_PICKS, out);
+        } else if (r < COMMON_CHANCE + RARE_CHANCE) {
+            dropTier = "РЕДКАЯ";
+            List<List<String[]>> pool = new ArrayList<>();
+            pool.add(bundle(item("minecraft:diamond_chestplate", 1)));
+            List<String> diamonds = new ArrayList<>(List.of("minecraft:diamond_helmet",
+                    "minecraft:diamond_leggings", "minecraft:diamond_boots", "minecraft:diamond_sword",
+                    "minecraft:diamond_pickaxe", "minecraft:diamond_axe"));
+            Collections.shuffle(diamonds, RANDOM);
+            pool.add(bundle(item(diamonds.get(0), 1), item(diamonds.get(1), 1)));
+            pool.add(bundle(item("minecraft:ender_pearl", 1)));
+            pool.add(bundle(item("minecraft:potion[potion_contents={potion:\"minecraft:swiftness\"}]", 1)));
+            addPicks(pool, RARE_PICKS, out);
+        } else {
+            dropTier = "ДЖЕКПОТ";
+            List<List<String[]>> pool = new ArrayList<>();
+            pool.add(bundle(item("minecraft:diamond_chestplate", 1), item("minecraft:diamond_leggings", 1)));
+            pool.add(bundle(item("minecraft:enchanted_golden_apple", 1), item("minecraft:diamond_sword", 1)));
+            addPicks(pool, JACKPOT_PICKS, out);
+        }
+        return out;
+    }
+
+    private static void fillChest() {
+        List<String[]> items = rollLoot();
+        List<Integer> slots = new ArrayList<>();
+        for (int i = 0; i < 27; i++) slots.add(i);
+        Collections.shuffle(slots, RANDOM);
+
+        for (int i = 0; i < items.size() && i < slots.size(); i++) {
+            String[] it = items.get(i);
+            runCmd("item replace block " + dropX + " " + dropY + " " + dropZ
+                    + " container." + slots.get(i) + " with " + it[0] + " " + it[1]);
+        }
+    }
+
+    // --- эффекты ---
+
+    private static void airdropEffects(int tick) {
+        dropAge++;
+
+        // Разблокировка сундука
+        if (dropLockTicks > 0) {
+            dropLockTicks--;
+            if (dropLockTicks == 0) {
+                soundAll("minecraft:block.beacon.activate", "1 1.3");
+                broadcast(Component.literal("🔓 Аирдроп РАЗБЛОКИРОВАН — кто первый возьмёт добычу?")
+                        .withStyle(ChatFormatting.GREEN));
+            }
+        }
+
+        double cx = dropX + 0.5;
+        double cz = dropZ + 0.5;
+
+        if (tick % 10 == 0) {
+            runCmd("particle minecraft:end_rod " + cx + " " + (dropY + 1.0) + " " + cz
+                    + " 0.35 0.6 0.35 0.02 4 force");
+            runCmd("particle minecraft:enchant " + cx + " " + (dropY + 1.5) + " " + cz
+                    + " 0.4 0.4 0.4 0.8 12 force");
+            // Столб света к небу
+            runCmd("particle minecraft:end_rod " + cx + " " + (dropY + 22.0) + " " + cz
+                    + " 0.12 20 0.12 0.005 6 force");
+        }
+        if (tick % 60 == 0) {
+            runCmd("playsound minecraft:block.beacon.ambient block @a " + cx + " " + (dropY + 1.0)
+                    + " " + cz + " 4 1");
+        }
+        if (tick % 100 == 0) {
+            runCmd("playsound minecraft:block.amethyst_block.chime block @a " + cx + " " + (dropY + 1.0)
+                    + " " + cz + " 4 1.4");
+        }
+
+        // Напоминание с координатами
+        if (dropAge > 0 && dropAge % (20 * 40) == 0) {
+            broadcast(Component.literal("📦 Аирдроп ещё не открыт: X " + dropX + "  Y " + dropY + "  Z " + dropZ)
+                    .withStyle(ChatFormatting.LIGHT_PURPLE));
+        }
+    }
+
+    private static void onDropOpened(ServerPlayer opener) {
+        dropState = DropState.OPENED;
+        String name = opener.getName().getString();
+
+        jingleActive = true;
+        jingleTick = 0;
+
+        double cx = dropX + 0.5;
+        double cz = dropZ + 0.5;
+        runCmd("particle minecraft:totem_of_undying " + cx + " " + (dropY + 1.0) + " " + cz
+                + " 0.5 0.8 0.5 0.5 80 force");
+        runCmd("particle minecraft:firework " + cx + " " + (dropY + 1.5) + " " + cz
+                + " 0.6 0.8 0.6 0.15 50 force");
+
+        titleAll(name, "gold", "открыл аирдроп!", "yellow", "5 50 15");
+        broadcast(Component.literal("🎁 " + name + " открыл аирдроп! Добыча: " + dropTier)
+                .withStyle(ChatFormatting.GOLD));
+    }
+
+    /** Шаг мини-музыки победы у сундука. */
+    private static void jingleStep() {
+        double cx = dropX + 0.5;
+        double cz = dropZ + 0.5;
+
+        for (Note n : JINGLE) {
+            if (n.tick() == jingleTick) {
+                runCmd("playsound " + n.sound() + " block @a " + cx + " " + (dropY + 1.0) + " " + cz
+                        + " 4 " + n.pitch());
+            }
+        }
+        if (jingleTick % 4 == 0) {
+            runCmd("particle minecraft:note " + cx + " " + (dropY + 1.8) + " " + cz
+                    + " 0.7 0.5 0.7 1 4 force");
+        }
+
+        jingleTick++;
+        if (jingleTick > 40) {
+            jingleActive = false;
+        }
+    }
+
     // ------------------------------------------------------------ voting
 
-    private static void startVote() {
+    /** Запуск голосования, которое начал игрок (/voteday, /votetime). */
+    private static int startPlayerVote(CommandContext<CommandSourceStack> ctx, VoteType type, int minutes) {
+        server = ctx.getSource().getServer();
+        ServerPlayer player = ctx.getSource().getPlayer();
+        if (player == null) {
+            ctx.getSource().sendFailure(Component.literal("Голосование могут начинать только игроки."));
+            return 0;
+        }
+        if (voteActive) {
+            ctx.getSource().sendFailure(Component.literal("Уже идёт голосование. Подожди его окончания."));
+            return 0;
+        }
+        if (paused) {
+            ctx.getSource().sendFailure(Component.literal("Сейчас пауза, голосовать нельзя."));
+            return 0;
+        }
+
+        int now = server.getTickCount();
+        int wait = PLAYER_VOTE_COOLDOWN_TICKS - (now - lastPlayerVoteTick);
+        if (wait > 0) {
+            ctx.getSource().sendFailure(Component.literal("Подожди ещё " + ((wait + 19) / 20)
+                    + " сек. перед следующим голосованием."));
+            return 0;
+        }
+
+        if (type == VoteType.DAY) {
+            if (pvp) {
+                ctx.getSource().sendFailure(Component.literal("Во время ПВП и так всегда день."));
+                return 0;
+            }
+        } else if (type == VoteType.ADD_TIME) {
+            if (!running) {
+                ctx.getSource().sendFailure(Component.literal("Таймер сейчас не идёт."));
+                return 0;
+            }
+            if (remainingTicks < MIN_TICKS_FOR_TIME_VOTE) {
+                ctx.getSource().sendFailure(Component.literal("До конца таймера слишком мало времени для голосования."));
+                return 0;
+            }
+        }
+
+        lastPlayerVoteTick = now;
+        beginVote(type, minutes, player);
+        return 1;
+    }
+
+    private static void beginVote(VoteType type, int minutes, ServerPlayer starter) {
         voteActive = true;
+        voteType = type;
+        voteMinutes = minutes;
         voteTicksLeft = VOTE_DURATION_TICKS;
         votes.clear();
 
-        titleAll("ГОЛОСОВАНИЕ", "gold", "Продлить на " + EXTENSION_MINUTES + " мин?", "yellow", "5 50 10");
+        String question;
+        if (type == VoteType.DAY) {
+            question = "Включить день?";
+        } else if (type == VoteType.ADD_TIME) {
+            question = "Добавить " + minutes + " мин?";
+        } else {
+            question = "Продлить на " + minutes + " мин?";
+        }
+
+        titleAll("ГОЛОСОВАНИЕ", "gold", question, "yellow", "5 50 10");
         soundAll("minecraft:block.note_block.bell", "1 1");
-        broadcast(Component.literal("🗳 Голосование за продление на " + EXTENSION_MINUTES + " мин ("
-                + (extensionsUsed + 1) + "/" + MAX_EXTENSIONS + "). Время на голосование: 20 секунд.")
-                .withStyle(ChatFormatting.GOLD));
+
+        if (starter != null) {
+            votes.put(starter.getUUID(), true);
+            broadcast(Component.literal("🗳 " + starter.getName().getString() + " предлагает: " + question
+                    + " Время на голосование: 20 секунд.").withStyle(ChatFormatting.GOLD));
+        } else {
+            broadcast(Component.literal("🗳 Голосование: " + question + " (" + (extensionsUsed + 1) + "/"
+                    + MAX_EXTENSIONS + "). Время на голосование: 20 секунд.").withStyle(ChatFormatting.GOLD));
+        }
+
         runCmd("tellraw @a [\"\",{\"text\":\"   [ ДА ]\",\"color\":\"green\",\"bold\":true,"
-                + "\"click_event\":{\"action\":\"run_command\",\"command\":\"/timer vote yes\"}},"
+                + "\"click_event\":{\"action\":\"run_command\",\"command\":\"/vote yes\"}},"
                 + "{\"text\":\"     \"},"
                 + "{\"text\":\"[ НЕТ ]\",\"color\":\"red\",\"bold\":true,"
-                + "\"click_event\":{\"action\":\"run_command\",\"command\":\"/timer vote no\"}}]");
-        broadcast(Component.literal("Или напиши: /timer vote yes   либо   /timer vote no")
+                + "\"click_event\":{\"action\":\"run_command\",\"command\":\"/vote no\"}}]");
+        broadcast(Component.literal("Или напиши: /vote yes   либо   /vote no")
                 .withStyle(ChatFormatting.GRAY));
     }
 
@@ -488,6 +1053,8 @@ public class TimerMod implements ModInitializer {
     }
 
     private static void resolveVote() {
+        VoteType type = voteType;
+        int minutes = voteMinutes;
         voteActive = false;
 
         int yes = 0, no = 0;
@@ -497,18 +1064,18 @@ public class TimerMod implements ModInitializer {
         }
         votes.clear();
 
-        boolean extend;
+        boolean pass;
         String note = "";
         if (yes + no == 0) {
-            extend = false;
+            pass = false;
             note = " Никто не проголосовал.";
         } else if (yes > no) {
-            extend = true;
+            pass = true;
         } else if (no > yes) {
-            extend = false;
+            pass = false;
         } else {
-            extend = RANDOM.nextBoolean();
-            note = " Ничья — рандом решил: " + (extend ? "ДА" : "НЕТ") + ".";
+            pass = RANDOM.nextBoolean();
+            note = " Ничья — рандом решил: " + (pass ? "ДА" : "НЕТ") + ".";
         }
 
         String stats = "";
@@ -518,15 +1085,46 @@ public class TimerMod implements ModInitializer {
         }
         broadcast(Component.literal("🗳 Итоги: " + stats + note).withStyle(ChatFormatting.GOLD));
 
-        if (extend) {
+        if (type == VoteType.DAY) {
+            if (pass) {
+                runCmd("time set day");
+                soundAll("minecraft:entity.player.levelup", "1 1");
+                broadcast(Component.literal("☀ Включён день.").withStyle(ChatFormatting.GREEN));
+            } else {
+                soundAll("minecraft:block.note_block.bass", "1 0.7");
+                broadcast(Component.literal("🌙 День не включён.").withStyle(ChatFormatting.YELLOW));
+            }
+            return;
+        }
+
+        if (type == VoteType.ADD_TIME) {
+            if (pass && running) {
+                remainingTicks += minutes * TICKS_PER_MINUTE;
+                totalTicks += minutes * TICKS_PER_MINUTE;
+                if (remainingTicks > TICKS_PER_MINUTE) {
+                    voteDone = false;
+                }
+                updateBarText();
+                soundAll("minecraft:entity.player.levelup", "1 1");
+                broadcast(Component.literal("➕ Добавлено " + minutes + " мин. Осталось: "
+                        + formatTime(remainingTicks)).withStyle(ChatFormatting.GREEN));
+            } else {
+                soundAll("minecraft:block.note_block.bass", "1 0.7");
+                broadcast(Component.literal("⏳ Время не добавлено.").withStyle(ChatFormatting.YELLOW));
+            }
+            return;
+        }
+
+        // Автоматическое голосование за продление
+        if (pass) {
             extensionsUsed++;
-            remainingTicks += EXTENSION_MINUTES * TICKS_PER_MINUTE;
-            totalTicks += EXTENSION_MINUTES * TICKS_PER_MINUTE;
+            remainingTicks += minutes * TICKS_PER_MINUTE;
+            totalTicks += minutes * TICKS_PER_MINUTE;
             voteDone = false;
             updateBarText();
             soundAll("minecraft:entity.player.levelup", "1 1");
             int left = MAX_EXTENSIONS - extensionsUsed;
-            broadcast(Component.literal("➕ Таймер продлён на " + EXTENSION_MINUTES + " мин. Осталось: "
+            broadcast(Component.literal("➕ Таймер продлён на " + minutes + " мин. Осталось: "
                     + formatTime(remainingTicks) + ". Продлений ещё можно: " + left + ".")
                     .withStyle(ChatFormatting.GREEN));
         } else {
@@ -544,29 +1142,82 @@ public class TimerMod implements ModInitializer {
             ctx.getSource().sendFailure(Component.literal("Игра уже идёт. Сначала отмени её: /game delete"));
             return 0;
         }
-        if (paused) {
-            ctx.getSource().sendFailure(Component.literal("Сейчас пауза. Сначала сними её: /game resume"));
-            return 0;
-        }
         if (server.getPlayerList().getPlayers().size() < 2) {
             ctx.getSource().sendFailure(Component.literal("Для игры нужно минимум 2 игрока онлайн."));
             return 0;
         }
 
+        // Пауза (/playerpause) снимается сама
+        if (paused) {
+            liftPause();
+            broadcast(Component.literal("▶ Пауза снята автоматически.").withStyle(ChatFormatting.GREEN));
+        }
+
         gameActive = true;
         gameEndTicks = 0;
 
-        // 1. очистка инвентарей
+        // 1. очистка инвентарей и убийство всех (чистый старт)
         runCmd("gamemode survival @a");
         runCmd("clear @a");
-        broadcast(Component.literal("🎮 Игра начинается! Инвентари очищены.").withStyle(ChatFormatting.GOLD));
+        runCmd("kill @a");
+        broadcast(Component.literal("🎮 Игра начинается! Инвентари очищены, все убиты.")
+                .withStyle(ChatFormatting.GOLD));
 
         // 2. команды
         randomTeams();
 
         // 3. таймер
         startTimer(minutes);
+
+        // 4. таблица с командами
+        for (Component line : helpLines()) {
+            broadcast(line);
+        }
         return 1;
+    }
+
+    private static int gameHelp(CommandContext<CommandSourceStack> ctx) {
+        for (Component line : helpLines()) {
+            ctx.getSource().sendSuccess(() -> line, false);
+        }
+        return 1;
+    }
+
+    private static Component line(String text, ChatFormatting format) {
+        return Component.literal(text).withStyle(format);
+    }
+
+    /** Таблица с командами: для игроков и для оператора. */
+    private static List<Component> helpLines() {
+        List<Component> l = new ArrayList<>();
+        l.add(line("━━━━━━━━━━━ КАК ИГРАТЬ ━━━━━━━━━━━", ChatFormatting.GOLD));
+        l.add(line("Пока идёт таймер — умирай и возрождайся как обычно.", ChatFormatting.GRAY));
+        l.add(line("Когда таймер кончится, начнётся ПВП: кто умер — тот спектатор.", ChatFormatting.GRAY));
+        l.add(line("Побеждает команда, в которой остались живые.", ChatFormatting.GRAY));
+        l.add(line("Во время таймера в случайном месте упадёт аирдроп с добычей — найди его первым!",
+                ChatFormatting.LIGHT_PURPLE));
+        l.add(line(" ", ChatFormatting.WHITE));
+
+        l.add(line("👥 ДЛЯ ИГРОКОВ:", ChatFormatting.GREEN));
+        l.add(line("  /vote yes  или  /vote no — голосовать (или кнопки [ДА] [НЕТ] в чате)", ChatFormatting.WHITE));
+        l.add(line("  /voteday — голосование: включить день", ChatFormatting.WHITE));
+        l.add(line("  /votetime <1-" + MAX_VOTE_MINUTES + "> — голосование: добавить минуты к таймеру",
+                ChatFormatting.WHITE));
+        l.add(line("  За минуту до конца таймера само пройдёт голосование за +" + EXTENSION_MINUTES
+                + " мин (до " + MAX_EXTENSIONS + " раз).", ChatFormatting.GRAY));
+        l.add(line(" ", ChatFormatting.WHITE));
+
+        l.add(line("🛠 ДЛЯ ОПЕРАТОРА — порядок, чтобы начать игру:", ChatFormatting.AQUA));
+        l.add(line("  1. /playerpause — заморозить всех (кроме тебя)", ChatFormatting.WHITE));
+        l.add(line("  2. /setworldspawn — точка возрождения там, где ты стоишь", ChatFormatting.WHITE));
+        l.add(line("  3. /kill @a — все возродятся на новой точке", ChatFormatting.WHITE));
+        l.add(line("  4. /randomteam — разделить игроков на команды", ChatFormatting.WHITE));
+        l.add(line("  5. /game start <мин> — старт (пауза снимется сама)", ChatFormatting.WHITE));
+        l.add(line("  Снять паузу вручную: /game resume  или  /playerpause off", ChatFormatting.GRAY));
+        l.add(line("  Прочее: /game pause, /game delete, /game help,", ChatFormatting.WHITE));
+        l.add(line("  /timer (статус), /timer add|start|stop <мин>, /timer spec off", ChatFormatting.WHITE));
+        l.add(line("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ChatFormatting.GOLD));
+        return l;
     }
 
     private static int gameDelete(CommandContext<CommandSourceStack> ctx) {
@@ -626,10 +1277,15 @@ public class TimerMod implements ModInitializer {
         soundAll("minecraft:block.note_block.bass", "1 0.6");
     }
 
-    private static void doResume() {
+    /** Тихо снимает паузу (без сообщений). */
+    private static void liftPause() {
         paused = false;
         pauseExempt = null;
         unfreezeAll();
+    }
+
+    private static void doResume() {
+        liftPause();
         if (running) updateBarText();
         else if (pvp) updatePvpBar();
         titleAll("▶ ПРОДОЛЖАЕМ", "green", "", "gray", "5 30 10");
@@ -672,6 +1328,8 @@ public class TimerMod implements ModInitializer {
         gameEndTicks = 0;
         winnerFxTicks = 0;
         winnerAnnounced = false;
+        jingleActive = false;
+        resetAirdrop();
         bar.removeAllPlayers();
 
         if (paused) {
@@ -701,19 +1359,23 @@ public class TimerMod implements ModInitializer {
     /** Нормальное завершение игры после победы. */
     private static void finishGame() {
         gameActive = false;
+        resetAirdrop();
         endPvp();
         wipePlayers();
-        broadcast(Component.literal("🏁 Игра окончена. Инвентари очищены, все убиты.")
+        broadcast(Component.literal("🏁 Игра окончена. Инвентари очищены, все убиты и возрождены.")
                 .withStyle(ChatFormatting.GOLD));
     }
 
-    /** Всем режим выживания, очистка инвентаря, смерть. */
+    /** Всем режим выживания, очистка инвентаря, смерть и автовозрождение. */
     private static void wipePlayers() {
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             p.setGameMode(GameType.SURVIVAL);
         }
         runCmd("clear @a");
+        // На пару секунд включаем мгновенное возрождение, чтобы никто не завис на экране смерти
+        runCmd("gamerule immediate_respawn true");
         runCmd("kill @a");
+        respawnRestoreTicks = 40;
     }
 
     // ------------------------------------------------------ timer commands
@@ -742,6 +1404,8 @@ public class TimerMod implements ModInitializer {
         voteActive = false;
         voteDone = false;
         votes.clear();
+
+        scheduleAirdrop();
 
         bar.removeAllPlayers();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
@@ -783,6 +1447,7 @@ public class TimerMod implements ModInitializer {
         }
         running = false;
         voteActive = false;
+        resetAirdrop();
         bar.removeAllPlayers();
         soundAll("minecraft:block.note_block.bass", "1 0.7");
         broadcast(Component.literal("⏹ Таймер остановлен. ПВП не начнётся.").withStyle(ChatFormatting.YELLOW));
@@ -794,6 +1459,7 @@ public class TimerMod implements ModInitializer {
         server = ctx.getSource().getServer();
         gameActive = false;
         gameEndTicks = 0;
+        resetAirdrop();
         if (pvp) {
             endPvp();
         } else if (running) {
@@ -897,6 +1563,8 @@ public class TimerMod implements ModInitializer {
         pvp = true;
         fallen.clear();
         kills.clear();
+        deathLog.clear();
+        firstBlood = null;
         winnerAnnounced = false;
         winnerSelector = "";
         winnerFxTicks = 0;
@@ -950,6 +1618,7 @@ public class TimerMod implements ModInitializer {
         titleAll("НИЧЬЯ", "gray", "Победителей нет", "gray", "10 60 20");
         soundAll("minecraft:entity.lightning_bolt.thunder", "0.7 0.8");
         broadcast(Component.literal("🤝 Ничья — никого не осталось в живых.").withStyle(ChatFormatting.GRAY));
+        printResults("ничья, никого не осталось");
         runCmd("effect clear @a minecraft:glowing");
         setKeepInventory(true);
         scheduleGameEnd();
@@ -971,6 +1640,7 @@ public class TimerMod implements ModInitializer {
         String title;
         String subtitle;
         String color;
+        String winnersText;
         Component chat;
 
         var team = first.getTeam();
@@ -987,6 +1657,7 @@ public class TimerMod implements ModInitializer {
             title = "ПОБЕДА " + teamName;
             subtitle = String.join(", ", nicks);
             color = teamColorName(teamName);
+            winnersText = teamName + " (" + String.join(", ", nicks) + ")";
             chat = Component.literal("★ ПОБЕДИЛА КОМАНДА " + teamName + ": " + String.join(", ", nicks) + " ★")
                     .withStyle(teamFormat(teamName));
         } else {
@@ -995,6 +1666,7 @@ public class TimerMod implements ModInitializer {
             title = name;
             subtitle = "ПОБЕДИТЕЛЬ ПВП";
             color = "gold";
+            winnersText = name;
             chat = Component.literal("★ ПОБЕДИТЕЛЬ: " + name + " ★").withStyle(ChatFormatting.GOLD);
         }
 
@@ -1003,18 +1675,8 @@ public class TimerMod implements ModInitializer {
         soundAll("minecraft:entity.lightning_bolt.thunder", "0.7 1.3");
         broadcast(chat);
 
-        String topName = null;
-        int topKills = 0;
-        for (Map.Entry<String, Integer> e : kills.entrySet()) {
-            if (e.getValue() > topKills) {
-                topKills = e.getValue();
-                topName = e.getKey();
-            }
-        }
-        if (topName != null) {
-            broadcast(Component.literal("🗡 Больше всего убийств: " + topName + " (" + topKills + ")")
-                    .withStyle(ChatFormatting.YELLOW));
-        }
+        // Итоги игры
+        printResults(winnersText);
 
         // Подсветку убираем, сохранение инвентаря возвращается
         runCmd("effect clear @a minecraft:glowing");
@@ -1024,17 +1686,53 @@ public class TimerMod implements ModInitializer {
         scheduleGameEnd();
     }
 
+    /** Итоги игры в чат. winners может быть null (если победителей не определяли). */
+    private static void printResults(String winners) {
+        chat("━━━━━━━━━━━ ИТОГИ ИГРЫ ━━━━━━━━━━━", ChatFormatting.GOLD);
+        if (winners != null) {
+            chat("🏆 Победа: " + winners, ChatFormatting.GOLD);
+        }
+        chat("⏱ Длительность ПВП: " + formatTime(pvpTicks), ChatFormatting.YELLOW);
+
+        if (firstBlood != null) {
+            chat("🩸 Первая кровь: " + firstBlood, ChatFormatting.RED);
+        }
+
+        if (kills.isEmpty()) {
+            chat("🗡 Убийств игроками не было.", ChatFormatting.GRAY);
+        } else {
+            List<Map.Entry<String, Integer>> top = new ArrayList<>(kills.entrySet());
+            top.sort(Map.Entry.<String, Integer>comparingByValue(Comparator.reverseOrder()));
+            String[] medals = {"🥇", "🥈", "🥉"};
+            chat("🗡 Больше всего убийств:", ChatFormatting.YELLOW);
+            for (int i = 0; i < Math.min(3, top.size()); i++) {
+                chat("   " + medals[i] + " " + top.get(i).getKey() + " — " + top.get(i).getValue(),
+                        ChatFormatting.YELLOW);
+            }
+        }
+
+        if (!deathLog.isEmpty()) {
+            chat("☠ Порядок выбывания: " + String.join(" → ", deathLog), ChatFormatting.GRAY);
+        }
+        chat("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ChatFormatting.GOLD);
+    }
+
     /** Если игра запущена через /game start — через несколько секунд закончить её. */
     private static void scheduleGameEnd() {
         if (gameActive) {
             gameEndTicks = GAME_END_DELAY_TICKS;
             broadcast(Component.literal("🏁 Через " + (GAME_END_DELAY_TICKS / 20)
-                    + " сек. игра закончится: инвентари очистятся, все будут убиты.")
+                    + " сек. игра закончится: инвентари очистятся, все будут убиты и возрождены.")
                     .withStyle(ChatFormatting.GRAY));
         }
     }
 
     private static void endPvp() {
+        // Если ПВП закончили вручную и итогов ещё не было — покажем их
+        if (!winnerAnnounced && !fallen.isEmpty()) {
+            printResults(null);
+        }
+
         pvp = false;
         bar.removeAllPlayers();
         winnerFxTicks = 0;
@@ -1083,6 +1781,10 @@ public class TimerMod implements ModInitializer {
         if (server == null) return;
         server.getCommands().performPrefixedCommand(
                 server.createCommandSourceStack().withSuppressedOutput(), command);
+    }
+
+    private static void chat(String text, ChatFormatting format) {
+        broadcast(Component.literal(text).withStyle(format));
     }
 
     private static void broadcast(Component text) {
